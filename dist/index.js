@@ -524,6 +524,14 @@ CREATE TABLE bot_memory (             -- [P4] \u80FD\u529B\u7C7B\u8BB0\u5FC6\u54
 CREATE INDEX idx_bot_memory_member ON bot_memory(member_id, created_at);
 `;
 
+// src/store/schema/009_bot_prompt.sql.ts
+var BOT_PROMPT_SCHEMA_SQL = `ALTER TABLE member_version ADD COLUMN prompt TEXT NOT NULL DEFAULT '';
+
+-- \u6CE8\u610F\uFF1Amember_version \u6709 IMMUTABLE \u89E6\u53D1\u5668\uFF08\u53D1\u5E03\u5373\u4E0D\u53EF\u53D8\uFF09\uFF0C\u8FC1\u79FB\u91CC\u4E0D\u80FD\u56DE\u586B\u5DF2\u6709\u884C\u3002
+-- \u5DF2\u6709 bot \u7684 prompt \u4FDD\u6301\u7A7A\u5B57\u7B26\u4E32\uFF08\u53EA\u6709 HAMS \u57FA\u7840\u89C4\u5219\uFF09\uFF0C\u9700\u8981\u65F6\u7531\u4EBA\u53D1\u5E03\u65B0\u7248\u672C\u8865\u4E0A\uFF1B
+-- \u65B0\u5EFA bot \u5728 insertMember \u91CC\u9ED8\u8BA4\u7528\u804C\u8D23\u4F5C\u4E3A\u521D\u7248\u63D0\u793A\u8BCD\u3002
+`;
+
 // src/store/schema/001_p1.sql.ts
 var P1_SCHEMA_SQL = `-- \u26A0\uFE0F \u81EA\u52A8\u751F\u6210\uFF0C\u8BF7\u52FF\u624B\u6539\u3002
 -- \u6765\u6E90\uFF08\u6743\u5A01\uFF09\uFF1Adocs/schema-2026-11-14.sql
@@ -1463,7 +1471,9 @@ var MIGRATIONS = Object.freeze([
   // v7：归档项目的「删除」标记（软删；工作项解绑保留，审计与证据不动）。
   { version: 7, name: "project-delete", sql: PROJECT_DELETE_SCHEMA_SQL },
   // v8：项目记忆（自动/手工/工具收集）+ 能力类记忆同步给 bot。
-  { version: 8, name: "project-memory", sql: MEMORY_SCHEMA_SQL }
+  { version: 8, name: "project-memory", sql: MEMORY_SCHEMA_SQL },
+  // v9：bot 每个配置版本的人设提示词（运行中创建的 bot 也能改提示词）。
+  { version: 9, name: "bot-prompt", sql: BOT_PROMPT_SCHEMA_SQL }
 ]);
 var TARGET_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;
 var SchemaTooNewError = class extends StoreError {
@@ -1519,7 +1529,7 @@ function migrate(db, options = {}) {
   const target = migrations[migrations.length - 1].version;
   const from = userVersion(db);
   if (from > target) throw new SchemaTooNewError(from, target);
-  const pending = pendingMigrations(from, migrations);
+  const pending2 = pendingMigrations(from, migrations);
   const applied = [];
   if (from >= 1 && verifyBaseline && useBuiltin) {
     const expected = tablesUpTo(from);
@@ -1527,7 +1537,7 @@ function migrate(db, options = {}) {
     const missing = expected.filter((name2) => !present.has(name2));
     if (missing.length) throw new SchemaIncompleteError(missing);
   }
-  for (const migration of pending) {
+  for (const migration of pending2) {
     transaction(db, () => {
       db.exec(migration.sql);
       setUserVersion(db, migration.version);
@@ -1834,9 +1844,9 @@ function ensureDefaultBots(db, ids, now, ownerHumanId) {
   );
   const insertVersion = db.prepare(
     `INSERT INTO member_version
-       (id, member_id, version, agent_preset, model, memory_scope_json, prompt_digest,
+       (id, member_id, version, agent_preset, model, memory_scope_json, prompt, prompt_digest,
         change_class, published_by, published_at)
-     VALUES (?, ?, 1, 'hams-bot', NULL, '{}', ?, 'major', ?, ?)`
+     VALUES (?, ?, 1, 'hams-bot', NULL, '{}', ?, ?, 'major', ?, ?)`
   );
   const grant = db.prepare(
     "INSERT OR IGNORE INTO member_permission (member_id, capability, scope, granted_by, granted_at) VALUES (?, ?, ?, ?, ?)"
@@ -1859,7 +1869,7 @@ ${spec.responsibility}`).digest("hex").slice(0, 16);
       now,
       now
     );
-    insertVersion.run(ids(), spec.id, digest, ownerHumanId, now);
+    insertVersion.run(ids(), spec.id, spec.responsibility, digest, ownerHumanId, now);
     for (const capability of spec.capabilities) grant.run(spec.id, capability, "global", ownerHumanId, now);
     result.created.push({ key: spec.id, id: spec.id, name: spec.name });
   }
@@ -2552,12 +2562,14 @@ function publishConfig(db, ids, now, actor, input) {
   const responsibility = input.responsibility === void 0 ? member.responsibility : string(input.responsibility, 4e3) ?? "";
   if (input.memoryScope !== void 0 && (!input.memoryScope || typeof input.memoryScope !== "object" || Array.isArray(input.memoryScope) || JSON.stringify(input.memoryScope).length > 8e3)) throw stateInvalid("\u8BB0\u5FC6\u8303\u56F4\u5FC5\u987B\u4E3AJSON\u5BF9\u8C61\u4E14\u4E0D\u8D85\u8FC78000\u5B57");
   const memory = input.memoryScope === void 0 ? previous?.memory_scope_json ?? "{}" : JSON.stringify(input.memoryScope);
-  if (input.changeClass === "minor" && (model !== (previous?.model ?? null) || agentPreset !== (previous?.agent_preset ?? null) || memory !== (previous?.memory_scope_json ?? "{}"))) throw stateInvalid("\u6A21\u578B\u3001preset\u6216\u8BB0\u5FC6\u8303\u56F4\u53D8\u5316\u9700\u663E\u5F0F\u9009\u62E9\u5927\u6539");
-  const version = member.current_version + 1, id = ids(), digest = createHash3("sha256").update(JSON.stringify({ responsibility, model, agentPreset, memory })).digest("hex");
-  db.prepare("INSERT INTO member_version (id,member_id,version,agent_preset,model,memory_scope_json,prompt_digest,change_class,published_by,published_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run(id, member.id, version, agentPreset, model, memory, digest, input.changeClass, actor, now);
+  const rawPrompt = input.prompt === void 0 ? previous?.prompt ?? "" : String(input.prompt ?? "").trim();
+  if (rawPrompt.length > 8192) throw stateInvalid("\u63D0\u793A\u8BCD\u6700\u591A 8192 \u5B57");
+  if (input.changeClass === "minor" && (model !== (previous?.model ?? null) || agentPreset !== (previous?.agent_preset ?? null) || memory !== (previous?.memory_scope_json ?? "{}") || rawPrompt !== (previous?.prompt ?? ""))) throw stateInvalid("\u6A21\u578B\u3001preset\u3001\u8BB0\u5FC6\u8303\u56F4\u6216\u63D0\u793A\u8BCD\u53D8\u5316\u9700\u663E\u5F0F\u9009\u62E9\u5927\u6539");
+  const version = member.current_version + 1, id = ids(), digest = createHash3("sha256").update(JSON.stringify({ responsibility, model, agentPreset, memory, prompt: rawPrompt })).digest("hex");
+  db.prepare("INSERT INTO member_version (id,member_id,version,agent_preset,model,memory_scope_json,prompt,prompt_digest,change_class,published_by,published_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(id, member.id, version, agentPreset, model, memory, rawPrompt, digest, input.changeClass, actor, now);
   if (previous) db.prepare("INSERT INTO member_version_skill (member_version_id,skill_id,skill_version_id) SELECT ?,skill_id,skill_version_id FROM member_version_skill WHERE member_version_id=?").run(id, previous.id);
   db.prepare("UPDATE member SET current_version=?,responsibility=?,updated_at=? WHERE id=?").run(version, responsibility, now, member.id);
-  return { version, versionId: id, changeClass: input.changeClass, responsibility, model, agentPreset, memoryScope: JSON.parse(memory) };
+  return { version, versionId: id, changeClass: input.changeClass, responsibility, model, agentPreset, memoryScope: JSON.parse(memory), prompt: rawPrompt };
 }
 function memberActivity(db, now, memberId, timeZone = "Asia/Shanghai") {
   const format = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" });
@@ -3186,7 +3198,12 @@ function listMembers(db, now, filter = {}) {
   }));
 }
 function getMember(db, now, memberId) {
-  const summary = listMembers(db, now, { limit: 200 }).find((item) => item.id === memberId);
+  const scope = db.prepare("SELECT scope_project_id FROM member WHERE id = ?").get(memberId);
+  if (!scope) throw stateInvalid(`\u6210\u5458\u4E0D\u5B58\u5728\uFF1A${memberId}`);
+  const summary = listMembers(db, now, {
+    ...scope.scope_project_id ? { projectId: scope.scope_project_id } : {},
+    limit: 200
+  }).find((item) => item.id === memberId);
   if (!summary) throw stateInvalid(`\u6210\u5458\u4E0D\u5B58\u5728\uFF1A${memberId}`);
   const positionHistory = db.prepare(
     `SELECT mp.position_id, p.name AS position_name, mp.starts_at, mp.ends_at, mp.assigned_by
@@ -3209,10 +3226,11 @@ function getMember(db, now, memberId) {
         ORDER BY created_at DESC LIMIT 10`
   ).all(memberId);
   const botVersions = db.prepare(
-    `SELECT id, version, model, agent_preset, change_class, published_by, published_at
+    `SELECT id, version, model, agent_preset, prompt, change_class, published_by, published_at
          FROM member_version WHERE member_id = ?
         ORDER BY version DESC LIMIT 10`
   ).all(memberId);
+  const subagent = db.prepare("SELECT value FROM hams_meta WHERE key = ?").get(`member:${memberId}:subagent`);
   const login = db.prepare(
     `SELECT id, login, display_name, auth_source, is_admin, status, last_login_at
          FROM hams_user WHERE member_id = ? LIMIT 1`
@@ -3239,6 +3257,7 @@ function getMember(db, now, memberId) {
       created_at: Number(item.created_at)
     })),
     bot_versions: botVersions.map((item) => ({ ...item, version: Number(item.version), published_at: Number(item.published_at) })),
+    subagent_session_id: subagent?.value ?? null,
     login
   };
 }
@@ -3256,6 +3275,7 @@ function listPositions(db) {
   }));
 }
 var BOT_GRANTABLE_CAPABILITIES = [
+  CAPABILITY.workItemCreate,
   CAPABILITY.workItemClaim,
   CAPABILITY.workItemExecute,
   CAPABILITY.workItemRequestClosure,
@@ -3296,6 +3316,7 @@ function insertMember(db, ids, now, actorId, input) {
   if (!owner || owner.kind !== "human") throw stateInvalid("bot \u7684\u8D23\u4EFB\u4EBA\u5FC5\u987B\u662F\u5B58\u5728\u7684\u4EBA");
   const agentPreset = optionalText3(input.agentPreset, "agent preset", 80);
   const model = optionalText3(input.model, "\u6A21\u578B", 120);
+  const prompt = optionalText3(input.prompt, "\u63D0\u793A\u8BCD", 8192) ?? responsibility;
   const granted = [...new Set(Array.isArray(input.capabilities) ? input.capabilities : [])];
   for (const capability of granted) {
     if (!BOT_GRANTABLE_CAPABILITIES.includes(capability)) {
@@ -3306,7 +3327,7 @@ function insertMember(db, ids, now, actorId, input) {
   if (!/^(global|domain:[^:]+|project:[^:]+)$/.test(scope)) {
     throw stateInvalid("\u6388\u6743\u8303\u56F4\u53EA\u80FD\u662F global / domain:<\u57DF> / project:<id>");
   }
-  const promptDigest = createHash6("sha256").update(JSON.stringify({ name: name2, responsibility, agentPreset, model })).digest("hex");
+  const promptDigest = createHash6("sha256").update(JSON.stringify({ name: name2, responsibility, agentPreset, model, prompt })).digest("hex");
   db.prepare(
     `INSERT INTO member (id, kind, name, domain, responsibility, role, status, current_version,
                          owner_human_id, created_at, updated_at)
@@ -3314,10 +3335,10 @@ function insertMember(db, ids, now, actorId, input) {
   ).run(id, name2, domain, responsibility, role, ownerId, now, now);
   db.prepare(
     `INSERT INTO member_version
-       (id, member_id, version, agent_preset, model, memory_scope_json, prompt_digest,
+       (id, member_id, version, agent_preset, model, memory_scope_json, prompt, prompt_digest,
         change_class, published_by, published_at)
-     VALUES (?, ?, 1, ?, ?, '{}', ?, 'major', ?, ?)`
-  ).run(ids(), id, agentPreset, model, promptDigest, actorId, now);
+     VALUES (?, ?, 1, ?, ?, '{}', ?, ?, 'major', ?, ?)`
+  ).run(ids(), id, agentPreset, model, prompt, promptDigest, actorId, now);
   const grant = db.prepare(
     `INSERT INTO member_permission (member_id, capability, scope, granted_by, granted_at)
      VALUES (?, ?, ?, ?, ?)`
@@ -4438,17 +4459,37 @@ var HamsService = class {
   createWorkItem(ctx, input) {
     return this.command(ctx, "workItem/create", input, () => {
       const principal = this.principal(ctx);
-      requireCapability(principal, CAPABILITY.workItemCreate);
-      if (principal.kind === "bot") throw denied("bot \u5EFA\u5355\u5FC5\u987B\u8D70\u63D0\u8BAE\uFF0C\u4E0D\u80FD\u76F4\u63A5\u5EFA\u5355");
-      const ownerHumanId = input.ownerHumanId ?? principal.memberId;
-      if (input.dedupeKey) {
-        const open = this.findOpenByDedupeKey(input.dedupeKey);
+      let ownerHumanId = input.ownerHumanId ?? principal.memberId;
+      let dedupeKey = input.dedupeKey ?? null;
+      let templateVersionId = input.templateVersionId ?? null;
+      if (principal.kind === "bot") {
+        if (!input.projectId) {
+          throw denied("bot \u5EFA\u5355\u5FC5\u987B\u6307\u5B9A\u9879\u76EE", "\u7528 hams_create_work_item \u5E76\u5E26\u4E0A projectId\uFF1B\u8DE8\u9879\u76EE\u5EFA\u5355\u5C5E\u4E8E\u8D8A\u6743");
+        }
+        const project = this.db.prepare("SELECT id, owner_human_id, coordinator_id, deleted_at FROM project WHERE id = ?").get(input.projectId);
+        if (!project || project.deleted_at) throw stateInvalid(`\u9879\u76EE\u4E0D\u5B58\u5728\uFF1A${input.projectId}`);
+        if (project.coordinator_id !== principal.memberId) {
+          requireCapability(principal, CAPABILITY.workItemCreate);
+          const joined = this.db.prepare("SELECT 1 AS ok FROM project_participant WHERE project_id = ? AND member_id = ? AND removed_at IS NULL").get(project.id, principal.memberId);
+          if (!joined) throw denied("\u53EA\u80FD\u7ED9\u81EA\u5DF1\u6240\u5728\u7684\u9879\u76EE\u5EFA\u5355", "\u5148\u8BA9\u9879\u76EE\u7BA1\u7406\u5458\u628A\u4F60\u62C9\u8FDB\u9879\u76EE\u56E2\u961F");
+        }
+        ownerHumanId = input.ownerHumanId ?? project.owner_human_id;
+        if (!templateVersionId) {
+          const prior = this.db.prepare("SELECT template_version_id FROM work_item WHERE project_id = ? AND template_version_id IS NOT NULL ORDER BY created_at DESC LIMIT 1").get(project.id);
+          templateVersionId = prior?.template_version_id ?? null;
+        }
+        dedupeKey = dedupeKey ?? `agent:${project.id}:${createHash9("sha256").update(String(input.title).trim()).digest("hex").slice(0, 16)}`;
+      } else {
+        requireCapability(principal, CAPABILITY.workItemCreate);
+      }
+      if (dedupeKey) {
+        const open = this.findOpenByDedupeKey(dedupeKey);
         if (open) {
           const auditId2 = this.audit(ctx, principal, {
             action: "workItem/create",
             subjectKind: "work_item",
             subjectId: open.id,
-            after: { duplicate: true, dedupeKey: input.dedupeKey }
+            after: { duplicate: true, dedupeKey }
           });
           return this.receipt(ctx, {
             status: "accepted",
@@ -4456,7 +4497,7 @@ var HamsService = class {
             objectRevision: open.revision,
             executionEpoch: open.execution_epoch,
             auditId: auditId2,
-            detail: { duplicate: true, dedupeKey: input.dedupeKey }
+            detail: { duplicate: true, dedupeKey }
           });
         }
       }
@@ -4466,9 +4507,9 @@ var HamsService = class {
         title: input.title,
         ownerHumanId,
         projectId: input.projectId ?? null,
-        templateVersionId: input.templateVersionId ?? null,
+        templateVersionId,
         assetId: input.assetId ?? null,
-        dedupeKey: input.dedupeKey ?? null,
+        dedupeKey,
         priority: input.priority,
         dueAt: input.dueAt ?? null,
         createdBy: principal.memberId
@@ -5148,10 +5189,10 @@ var HamsService = class {
           throw evidenceIncomplete(`\u5224\u636E\u9A8C\u8BC1\u5668 ${template.validator_key} \u672A\u901A\u8FC7`, result.detail ?? null);
         }
       }
-      const pending = this.db.prepare(
+      const pending2 = this.db.prepare(
         `SELECT id FROM approval WHERE subject_kind = 'work_item_close' AND subject_id = ? AND status = 'pending'`
       ).get(item.id);
-      if (pending) throw stateInvalid("\u8BE5\u5DE5\u4F5C\u9879\u5DF2\u6709\u4E00\u6761\u5F85\u51B3\u5BA1\u6279", "\u7B49\u73B0\u6709\u5BA1\u6279\u7ED3\u675F\u6216\u5931\u6548\u540E\u518D\u7533\u8BF7");
+      if (pending2) throw stateInvalid("\u8BE5\u5DE5\u4F5C\u9879\u5DF2\u6709\u4E00\u6761\u5F85\u51B3\u5BA1\u6279", "\u7B49\u73B0\u6709\u5BA1\u6279\u7ED3\u675F\u6216\u5931\u6548\u540E\u518D\u7533\u8BF7");
       if (item.status === "waiting_review") {
         this.db.prepare("UPDATE work_item SET revision = revision + 1, updated_at = ? WHERE id = ?").run(at, item.id);
       } else {
@@ -5985,7 +6026,7 @@ var HamsService = class {
         action: "member/create",
         subjectKind: "member",
         subjectId: created.id,
-        after: { kind: created.kind, version: created.version, capabilities: created.capabilities, responsibility: input.responsibility ?? "", model: input.model ?? null, agentPreset: input.agentPreset ?? null, memoryScope: {} }
+        after: { kind: created.kind, version: created.version, capabilities: created.capabilities, responsibility: input.responsibility ?? "", model: input.model ?? null, agentPreset: input.agentPreset ?? null, prompt: input.prompt ?? "", memoryScope: {} }
       });
       return this.receipt(ctx, {
         status: "applied",
@@ -7613,6 +7654,7 @@ var ROUTES = new Map([
           ownerHumanId: optionalString(payload.ownerHumanId, "payload.ownerHumanId"),
           agentPreset: optionalString(payload.agentPreset, "payload.agentPreset"),
           model: optionalString(payload.model, "payload.model"),
+          prompt: optionalString(payload.prompt, "payload.prompt"),
           capabilities: stringArray(payload.capabilities, "payload.capabilities"),
           scope: optionalString(payload.scope, "payload.scope")
         });
@@ -8027,6 +8069,10 @@ function createHamsTools(options) {
           const assigneeId = asString(args.assigneeId, "assigneeId");
           const result = service.assignWorkItem(context(identity2, exec, "assign"), { workItemId, memberId: assigneeId });
           try {
+            options.onAssigned?.(workItemId);
+          } catch {
+          }
+          try {
             groupPort().noteAssignment?.(exec.sessionId, {
               memberId: assigneeId,
               text: `\u8BF7\u63A5\u624B\u5DE5\u4F5C\u9879 ${workItemId}\uFF0C\u5728\u7FA4\u91CC\u8BF4\u660E\u4E0B\u4E00\u6B65\u5E76\u63A5\u5355\u3002`
@@ -8034,6 +8080,44 @@ function createHamsTools(options) {
           } catch {
           }
           return result;
+        });
+      }
+    },
+    {
+      name: "hams_create_work_item",
+      description: "\u5728\u9879\u76EE\u91CC\u767B\u8BB0\u4E00\u6761\u5DE5\u4F5C\u4EFB\u52A1\uFF08\u5DE5\u4F5C\u9879\uFF09\u3002\u9879\u76EE\u63A8\u8FDB bot \u53EF\u4EE5\u76F4\u63A5\u7ED9\u672C\u9879\u76EE\u5EFA\u5355\uFF1B\u5176\u4ED6 bot \u9700\u8981 work_item.create \u80FD\u529B\u3002\u540C\u4E00\u9879\u76EE + \u540C\u4E00\u6807\u9898\u4F1A\u81EA\u52A8\u53BB\u91CD\uFF0C\u91CD\u590D\u8C03\u7528\u8FD4\u56DE\u5DF2\u6709\u5DE5\u4F5C\u9879\u3002\u5EFA\u5355\u4E0D\u4F1A\u81EA\u52A8\u6D3E\u6D3B\uFF1A\u9700\u8981\u518D\u7528 hams_assign_task \u6307\u6D3E\uFF0C\u5E76\u5728\u7FA4\u804A\u91CC @ \u5BF9\u65B9\u3002\u5F53\u4EBA\u7C7B\u63D0\u51FA\u4E00\u4EF6\u65B0\u6D3B\u3001\u6216\u9879\u76EE\u76EE\u6807\u9700\u8981\u62C6\u6210\u53EF\u6267\u884C\u4EFB\u52A1\u65F6\u5148\u7528\u8FD9\u4E2A\u5DE5\u5177\u5EFA\u5355\uFF0C\u4E0D\u8981\u53EA\u5728\u7FA4\u91CC\u53E3\u5934\u7B54\u5E94\u3002",
+      parameters: {
+        type: "object",
+        properties: {
+          projectId: { type: "string", description: "\u5DE5\u4F5C\u9879\u6240\u5C5E\u9879\u76EE id\uFF08\u5FC5\u586B\uFF09" },
+          title: { type: "string", description: "\u4EFB\u52A1\u6807\u9898\uFF1A\u5199\u6E05\u8981\u4EA4\u4ED8\u4EC0\u4E48\u3001\u8303\u56F4\u4E0E\u9A8C\u6536\u53E3\u5F84" },
+          domain: { type: "string", description: "\u4E1A\u52A1\u57DF\uFF1B\u7701\u7565\u4E3A\u300C\u901A\u7528\u300D" },
+          category: { type: "string", description: "\u4EFB\u52A1\u7C7B\u522B\uFF1B\u7701\u7565\u4E3A\u300C\u6267\u884C\u300D" },
+          ownerHumanId: { type: "string", description: "\u8D1F\u8D23\u4EBA\uFF08\u5FC5\u987B\u662F\u4EBA\u7684\u6210\u5458 id\uFF09\uFF1B\u7701\u7565\u4E3A\u9879\u76EE\u8D1F\u8D23\u4EBA" },
+          templateVersionId: { type: "string", description: "\u5224\u636E\u6A21\u677F\u7248\u672C id\uFF1B\u7701\u7565\u5219\u5EFA\u5355\u540E\u518D\u8865" },
+          dedupeKey: { type: "string", description: "\u5E42\u7B49\u952E\uFF1B\u7701\u7565\u65F6\u6309\u9879\u76EE + \u6807\u9898\u81EA\u52A8\u751F\u6210" },
+          priority: { type: "number", description: "\u4F18\u5148\u7EA7\uFF0C\u6570\u5B57\u8D8A\u5C0F\u8D8A\u9760\u524D" },
+          dueAt: { type: "number", description: "\u622A\u6B62\u65F6\u95F4\uFF08UTC \u6BEB\u79D2\uFF09" }
+        },
+        required: ["projectId", "title"],
+        additionalProperties: false
+      },
+      execute(rawArgs, exec) {
+        return run(() => {
+          const identity2 = memberIdentity(exec);
+          const args = asObject(rawArgs, "args");
+          assertNoIdentityArgs(args);
+          return service.createWorkItem(context(identity2, exec, "create-work-item"), {
+            projectId: asString(args.projectId, "projectId"),
+            title: asString(args.title, "title"),
+            domain: optionalString(args.domain, "domain") || "\u901A\u7528",
+            category: optionalString(args.category, "category") || "\u6267\u884C",
+            ownerHumanId: optionalString(args.ownerHumanId, "ownerHumanId"),
+            templateVersionId: optionalString(args.templateVersionId, "templateVersionId"),
+            dedupeKey: optionalString(args.dedupeKey, "dedupeKey"),
+            priority: args.priority === void 0 ? void 0 : asNumber(args.priority, "priority"),
+            dueAt: args.dueAt === void 0 ? void 0 : asNumber(args.dueAt, "dueAt")
+          });
         });
       }
     },
@@ -8383,6 +8467,7 @@ var TOOL_NAMES = [
   "hams_get_work_item",
   "hams_claim",
   "hams_assign_task",
+  "hams_create_work_item",
   "hams_list_project_work",
   "hams_group_members",
   "hams_group_send",
@@ -8936,6 +9021,26 @@ function createTicker(options) {
 // src/service/chat.ts
 import { createHash as createHash10 } from "node:crypto";
 var DEFAULT_BOT_PRESET = "hams-bot";
+function promptContextBlock(prompt, preset) {
+  const text4 = String(prompt || "").trim();
+  if (!text4 || !preset || preset === DEFAULT_BOT_PRESET) return "";
+  return `
+\u3010\u4F60\u7684\u8BBE\u5B9A\uFF08\u6210\u5458\u914D\u7F6E\u53D1\u5E03\uFF1B\u4E0E\u901A\u7528\u8BF4\u660E\u51B2\u7A81\u65F6\u4EE5\u8FD9\u91CC\u4E3A\u51C6\uFF09\u3011
+${text4}`;
+}
+function subagentTaskPrompt(events, createdAt) {
+  for (const raw of events) {
+    if (!raw || typeof raw !== "object") continue;
+    const event = raw;
+    if (event.type !== "user/message") continue;
+    if (event.data?.source?.kind !== "user") continue;
+    if (Number(event.time || 0) < Number(createdAt || 0)) continue;
+    const content = Array.isArray(event.data.content) ? event.data.content : [];
+    const text4 = content.filter((block2) => block2 && typeof block2 === "object" && block2.type === "text").map((block2) => String(block2.text ?? "")).join("\n").trim();
+    if (text4) return text4.slice(0, 8192);
+  }
+  return "";
+}
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -8944,11 +9049,13 @@ var ChatService = class {
   runtime;
   now;
   id;
+  intake;
   constructor(options) {
     this.db = options.db;
     this.runtime = options.runtime;
     this.now = options.now ?? (() => Date.now());
     this.id = options.idFactory ?? createIdFactory(this.now);
+    this.intake = options.intake;
   }
   get available() {
     return this.runtime.available;
@@ -8989,13 +9096,14 @@ var ChatService = class {
       });
     }
     const version = Number(member.current_version || 0);
-    const config = version ? this.db.prepare("SELECT agent_preset, model FROM member_version WHERE member_id = ? AND version = ?").get(memberId, version) : void 0;
+    const config = version ? this.db.prepare("SELECT agent_preset, model, prompt FROM member_version WHERE member_id = ? AND version = ?").get(memberId, version) : void 0;
     return {
       memberId,
       memberName: member.name,
       memberVersion: version,
       agentPreset: (config?.agent_preset || "").trim() || DEFAULT_BOT_PRESET,
-      model: config?.model ?? null
+      model: config?.model ?? null,
+      prompt: config?.prompt || ""
     };
   }
   pointer(kind, targetId) {
@@ -9038,9 +9146,9 @@ var ChatService = class {
       });
     }
     const sameConfig = existing && existing.memberId === peer.memberId && existing.memberVersion === peer.memberVersion && existing.agentPreset === peer.agentPreset && (existing.model || null) === model;
-    const context = input.kind === "project" ? `\u4F60\u5728 HAMS \u9879\u76EE\u300A${peer.title}\u300B\uFF08projectId=${input.targetId}\uFF09\u7684\u7FA4\u804A\u91CC\uFF0C\u662F\u8FD9\u4E2A\u9879\u76EE\u7684\u63A8\u8FDB bot\u3002\u4F60\u53EF\u4EE5\u7528 hams_list_project_work \u67E5\u8FD9\u4E2A\u9879\u76EE\u7684\u5DE5\u4F5C\u9879\u8FDB\u5C55\uFF0C\u7528 hams_assign_task \u628A ready \u5DE5\u4F5C\u9879\u6307\u6D3E\u7ED9\u5176\u4ED6 bot\uFF1B\u5173\u5355\u4E0E\u5BA1\u6279\u53EA\u80FD\u7531\u4EBA\u505A\u3002\u7528\u4E2D\u6587\u7B80\u77ED\u56DE\u7B54\u3002` + (projectMemoryBlock(this.db, input.targetId) ? `
+    const context = (input.kind === "project" ? `\u4F60\u5728 HAMS \u9879\u76EE\u300A${peer.title}\u300B\uFF08projectId=${input.targetId}\uFF09\u7684\u7FA4\u804A\u91CC\uFF0C\u662F\u8FD9\u4E2A\u9879\u76EE\u7684\u63A8\u8FDB bot\u3002\u4F60\u53EF\u4EE5\u7528 hams_list_project_work \u67E5\u8FD9\u4E2A\u9879\u76EE\u7684\u5DE5\u4F5C\u9879\u8FDB\u5C55\uFF0C\u7528 hams_assign_task \u628A ready \u5DE5\u4F5C\u9879\u6307\u6D3E\u7ED9\u5176\u4ED6 bot\uFF1B\u5173\u5355\u4E0E\u5BA1\u6279\u53EA\u80FD\u7531\u4EBA\u505A\u3002\u7528\u4E2D\u6587\u7B80\u77ED\u56DE\u7B54\u3002` + (projectMemoryBlock(this.db, input.targetId) ? `
 ${projectMemoryBlock(this.db, input.targetId)}` : "") : `\u4F60\u5728 HAMS \u91CC\u4F5C\u4E3A\u300A${peer.memberName}\u300B\u4E0E\u4EBA\u7C7B\u5355\u804A\uFF0C\u8EAB\u4EFD\u662F\u6210\u5458 ${peer.memberId}\u3002\u6D89\u53CA\u5DE5\u4F5C\u9879\u65F6\u7528 HAMS \u5DE5\u5177\u8BFB\u5199\u4E8B\u5B9E\uFF0C\u4E0D\u8981\u7F16\u9020\u72B6\u6001\uFF1B\u5173\u5355\u4E0E\u5BA1\u6279\u53EA\u80FD\u7531\u4EBA\u505A\u3002\u7528\u4E2D\u6587\u7B80\u77ED\u56DE\u7B54\u3002` + (memberMemoryBlock(this.db, peer.memberId) ? `
-${memberMemoryBlock(this.db, peer.memberId)}` : "");
+${memberMemoryBlock(this.db, peer.memberId)}` : "")) + promptContextBlock(peer.prompt, peer.agentPreset);
     const { sessionId } = await this.runtime.ensure({
       sessionId: sameConfig ? existing.sessionId : void 0,
       key: `chat:${input.kind}:${input.targetId}`,
@@ -9048,6 +9156,7 @@ ${memberMemoryBlock(this.db, peer.memberId)}` : "");
       memberName: peer.memberName,
       memberVersion: peer.memberVersion,
       agentPreset: peer.agentPreset,
+      prompt: peer.prompt,
       model,
       title: input.kind === "project" ? `\u9879\u76EE\u7FA4\u804A \xB7 ${peer.title}` : `\u5355\u804A \xB7 ${peer.memberName}`,
       context
@@ -9059,10 +9168,61 @@ ${memberMemoryBlock(this.db, peer.memberId)}` : "");
       memberVersion: peer.memberVersion,
       agentPreset: peer.agentPreset,
       model,
+      prompt: peer.prompt,
       at
     };
     if (!sameConfig || !existing) this.savePointer(input.kind, input.targetId, pointer);
     return { ...peer, model, sessionId, createdAt: existing?.at ?? at, updatedAt: at };
+  }
+  /** 单聊时反查这个 bot 唯一能代表的项目：优先它推进的项目，其次唯一参与的项目。 */
+  projectForBot(memberId) {
+    const coordinated = this.db.prepare("SELECT id FROM project WHERE coordinator_id = ? AND status = 'active' AND deleted_at IS NULL ORDER BY updated_at DESC").all(memberId);
+    if (coordinated.length === 1) return coordinated[0].id;
+    if (coordinated.length > 1) return null;
+    const joined = this.db.prepare(
+      `SELECT p.id FROM project_participant pp JOIN project p ON p.id = pp.project_id
+          WHERE pp.member_id = ? AND pp.removed_at IS NULL AND p.status = 'active' AND p.deleted_at IS NULL
+          ORDER BY pp.added_at DESC`
+    ).all(memberId);
+    return joined.length === 1 ? joined[0].id : null;
+  }
+  intakeSystemText(outcome) {
+    if (outcome.kind === "create") return `\u5DF2\u628A\u8FD9\u6761\u6D88\u606F\u767B\u8BB0\u4E3A\u5DE5\u4F5C\u9879\u300A${outcome.title}\u300B\uFF08${outcome.workItemId}\uFF09`;
+    const label = { paused: "\u6682\u505C", active: "\u7EE7\u7EED", cancelled: "\u53D6\u6D88" }[outcome.status] || outcome.status;
+    return `\u5DF2\u628A\u5DE5\u4F5C\u9879\u300A${outcome.title}\u300B\u72B6\u6001\u6539\u4E3A\u300C${label}\u300D`;
+  }
+  intakeNote(outcome) {
+    if (!outcome) return "";
+    if (outcome.kind === "create") {
+      return `\u3010\u7CFB\u7EDF\u3011\u4EBA\u7C7B\u8FD9\u53E5\u8BDD\u5DF2\u7ECF\u767B\u8BB0\u4E3A\u5DE5\u4F5C\u9879 ${outcome.workItemId}\u300A${outcome.title}\u300B${outcome.created ? "" : "\uFF08\u6B64\u524D\u5DF2\u5B58\u5728\uFF0C\u76F4\u63A5\u590D\u7528\uFF09"}\uFF1B\u76F4\u63A5\u7528\u5B83\u63A8\u8FDB\u6216\u6D3E\u6D3B\uFF0C\u4E0D\u8981\u91CD\u590D\u5EFA\u5355\u3002
+
+`;
+    }
+    return `\u3010\u7CFB\u7EDF\u3011\u4EBA\u7C7B\u8FD9\u53E5\u8BDD\u5DF2\u7ECF\u66F4\u65B0\u5DE5\u4F5C\u9879 ${outcome.workItemId}\u300A${outcome.title}\u300B\u7684\u72B6\u6001${outcome.changed ? "" : "\uFF08\u6B64\u524D\u5DF2\u662F\u8BE5\u72B6\u6001\uFF09"}\uFF1B\u4E0D\u8981\u518D\u91CD\u590D\u5904\u7406\u3002
+
+`;
+  }
+  /** 人发出的一条消息是否要建单/改状态；返回要附加给 bot 的提示。 */
+  async intakeNoteFor(ctx, thread, text4) {
+    if (!this.intake) return "";
+    const projectId = thread.kind === "project" ? thread.targetId : this.projectForBot(thread.memberId);
+    if (!projectId) return "";
+    let recent = "";
+    try {
+      const view = await this.runtime.read(thread.sessionId);
+      recent = view.messages.slice(-4).map((message) => `${message.role}: ${message.text.slice(0, 200)}`).join("\n");
+    } catch {
+      recent = "";
+    }
+    const result = await this.intake.registerFromMessage({
+      projectId,
+      senderId: ctx.principalId,
+      text: text4,
+      messageId: `msg-${this.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      mentionedMemberId: null,
+      recent
+    });
+    return this.intakeNote(result);
   }
   async send(ctx, input) {
     const text4 = String(input.text || "").trim();
@@ -9070,9 +9230,16 @@ ${memberMemoryBlock(this.db, peer.memberId)}` : "");
     if (text4.length > 8e3) throw new HamsError("STATE_INVALID", "\u5355\u6761\u6D88\u606F\u4E0D\u80FD\u8D85\u8FC7 8000 \u5B57");
     const thread = await this.open(ctx, { kind: input.kind, targetId: input.targetId });
     const memory = thread.kind === "member" ? memberMemoryBlock(this.db, thread.memberId) : "";
-    await this.runtime.send(thread.sessionId, memory ? `${memory}
+    let intakeNote = "";
+    try {
+      intakeNote = await this.intakeNoteFor(ctx, thread, text4);
+    } catch {
+      intakeNote = "";
+    }
+    const body = memory ? `${memory}
 
-${text4}` : text4);
+${text4}` : text4;
+    await this.runtime.send(thread.sessionId, intakeNote ? `${intakeNote}${body}` : body);
     return { sessionId: thread.sessionId, accepted: true };
   }
   async read(ctx, input) {
@@ -9094,7 +9261,8 @@ ${text4}` : text4);
         memberName: "",
         memberVersion: pointer.memberVersion,
         agentPreset: pointer.agentPreset,
-        model: pointer.model
+        model: pointer.model,
+        prompt: pointer.prompt || ""
       };
     }
     const { messages, running, error } = await this.runtime.read(pointer.sessionId);
@@ -9186,9 +9354,10 @@ ${text4}` : text4);
       memberName: member.memberName,
       memberVersion: member.memberVersion,
       agentPreset: member.agentPreset,
+      prompt: member.prompt,
       model,
       title: `\u9879\u76EE\u7FA4 \xB7 ${project.name} \xB7 ${member.memberName}`,
-      context
+      context: context + promptContextBlock(member.prompt, member.agentPreset)
     });
     const at = this.now();
     const pointer = {
@@ -9197,6 +9366,7 @@ ${text4}` : text4);
       memberVersion: member.memberVersion,
       agentPreset: member.agentPreset,
       model,
+      prompt: member.prompt,
       at
     };
     this.savePointerAt(key, pointer);
@@ -9218,14 +9388,16 @@ ${text4}` : text4);
           ORDER BY pp.added_at`
     ).all(projectId);
     for (const row of members) {
-      rows.push({ memberId: row.member_id, name: row.name, kind: row.kind, status: row.status, brief: row.brief, addedAt: row.added_at });
+      const kind = row.kind === "temp" && row.brief.startsWith("\u5B50\u4EE3\u7406") ? "subagent" : row.kind;
+      rows.push({ memberId: row.member_id, name: row.name, kind, status: row.status, brief: row.brief, addedAt: row.added_at });
     }
     return rows;
   }
   rosterText(projectId) {
     const project = this.projectRow(projectId);
     const rows = this.teamRows(projectId);
-    const lines = rows.map((row) => `- ${row.name}\uFF08${row.kind === "coordinator" ? "\u63A8\u8FDB bot" : row.kind === "temp" ? "\u4E34\u65F6 bot" : "\u6210\u5458"}\uFF0Cid=${row.memberId}\uFF09`);
+    const kindLabel = (kind) => kind === "coordinator" ? "\u63A8\u8FDB bot" : kind === "subagent" ? "\u5B50\u4EE3\u7406" : kind === "temp" ? "\u4E34\u65F6 bot" : "\u6210\u5458";
+    const lines = rows.map((row) => `- ${row.name}\uFF08${kindLabel(row.kind)}\uFF0Cid=${row.memberId}\uFF09`);
     return `\u3010\u9879\u76EE\u7FA4 ${project.name}\u3011\u56E2\u961F\u6210\u5458\uFF1A
 ${lines.join("\n")}`;
   }
@@ -9288,29 +9460,203 @@ ${lines.join("\n")}`;
       this.db.prepare("INSERT OR REPLACE INTO chat_cursor (session_id, project_id, last_seq) VALUES (?, ?, ?)").run(pointer.sessionId, project.id, lastSeq);
     }
   }
+  /** 最近一次扫描子代理的时间；团队页轮询时别每次都翻全部会话。 */
+  lastSubagentScan = 0;
+  /**
+   * DSH 的 subagent 是独立会话（header.origin='subagent'、parentSession=父会话），
+   * 不是 HAMS 成员；团队页要看得见，就得把它登记成本项目的一条临时成员。
+   * 同一个子会话只登记一次；子代理结束也不删，保留可追溯。
+   */
+  registerSubagent(input) {
+    const childSessionId = String(input.childSessionId || "").trim();
+    const parentSessionId = String(input.parentSessionId || "").trim();
+    if (!childSessionId || !parentSessionId) return null;
+    const mapped = this.db.prepare("SELECT value FROM hams_meta WHERE key = ?").get(`subagent:session:${childSessionId}`);
+    if (mapped) {
+      try {
+        const parsed = JSON.parse(mapped.value);
+        if (typeof parsed.memberId === "string" && parsed.memberId) return { memberId: parsed.memberId };
+      } catch {
+      }
+    }
+    const project = this.projectRefOfSession(parentSessionId);
+    if (!project) return null;
+    const label = String(input.label || "").trim().slice(0, 40);
+    const prompt = String(input.prompt || "").trim().slice(0, 8192);
+    let name2 = label || `\u5B50\u4EE3\u7406 ${childSessionId.slice(0, 6)}`;
+    const clash = this.db.prepare("SELECT 1 AS hit FROM member WHERE name = ?").get(name2);
+    if (clash) name2 = `${name2.slice(0, 34)} \xB7 ${childSessionId.slice(0, 4)}`;
+    const at = this.now();
+    const memberId = this.id();
+    this.db.prepare(
+      `INSERT INTO member (id, kind, name, domain, responsibility, role, status, current_version,
+                             owner_human_id, scope_project_id, created_at, updated_at)
+         VALUES (?, 'bot', ?, NULL, ?, 'observer', 'active', 1, ?, ?, ?, ?)`
+    ).run(memberId, name2, label, project.ownerHumanId, project.id, at, at);
+    const digest = createHash10("sha256").update(`subagent
+${childSessionId}
+${label}`).digest("hex").slice(0, 16);
+    this.db.prepare(
+      `INSERT INTO member_version
+           (id, member_id, version, agent_preset, model, memory_scope_json, prompt, prompt_digest,
+            change_class, published_by, published_at)
+         VALUES (?, ?, 1, ?, NULL, '{}', ?, ?, 'major', ?, ?)`
+    ).run(this.id(), memberId, "hams-bot", prompt, digest, project.ownerHumanId, at);
+    this.db.prepare(
+      `INSERT INTO project_participant (project_id, member_id, kind, brief, added_by, added_at)
+         VALUES (?, ?, 'temp', ?, ?, ?)`
+    ).run(project.id, memberId, `\u5B50\u4EE3\u7406 \xB7 ${label || childSessionId.slice(0, 6)}`, project.ownerHumanId, at);
+    this.db.prepare("INSERT OR REPLACE INTO hams_meta (key, value) VALUES (?, ?)").run(
+      `subagent:session:${childSessionId}`,
+      JSON.stringify({ memberId, projectId: project.id })
+    );
+    this.db.prepare("INSERT OR REPLACE INTO hams_meta (key, value) VALUES (?, ?)").run(
+      `member:${memberId}:subagent`,
+      childSessionId
+    );
+    return { memberId };
+  }
+  /** 由父会话反查项目：群会话索引 → 工作项线程 → 单聊后面挂的推进/参与项目。 */
+  /** 和公开的 `projectOfSession`（只认群索引）区分：这里要把父会话反查成项目，含工作项线程与单聊。 */
+  projectRefOfSession(sessionId) {
+    if (!sessionId) return null;
+    const groupProjectId = this.projectOfSession(sessionId);
+    if (groupProjectId) {
+      const row = this.db.prepare("SELECT id, owner_human_id FROM project WHERE id = ? AND deleted_at IS NULL").get(groupProjectId);
+      if (row) return { id: row.id, ownerHumanId: row.owner_human_id };
+    }
+    const thread = this.db.prepare(
+      `SELECT w.project_id AS projectId FROM work_item_thread t
+           JOIN work_item w ON w.id = t.work_item_id
+          WHERE t.session_id = ? AND w.project_id IS NOT NULL
+          ORDER BY t.started_at DESC LIMIT 1`
+    ).get(sessionId);
+    if (thread) {
+      const row = this.db.prepare("SELECT id, owner_human_id FROM project WHERE id = ? AND deleted_at IS NULL").get(thread.projectId);
+      if (row) return { id: row.id, ownerHumanId: row.owner_human_id };
+    }
+    const chatMemberId = this.memberOfSession(sessionId);
+    if (chatMemberId) {
+      const coordinator = this.db.prepare("SELECT id, owner_human_id FROM project WHERE coordinator_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT 1").get(chatMemberId);
+      if (coordinator) return { id: coordinator.id, ownerHumanId: coordinator.owner_human_id };
+      const participant = this.db.prepare(
+        `SELECT p.id, p.owner_human_id FROM project_participant pp JOIN project p ON p.id = pp.project_id
+            WHERE pp.member_id = ? AND pp.removed_at IS NULL AND p.deleted_at IS NULL
+            ORDER BY pp.added_at DESC LIMIT 1`
+      ).get(chatMemberId);
+      if (participant) return { id: participant.id, ownerHumanId: participant.owner_human_id };
+    }
+    return null;
+  }
+  subagentSessionOf(memberId) {
+    const row = this.db.prepare("SELECT value FROM hams_meta WHERE key = ?").get(`member:${memberId}:subagent`);
+    return row?.value || null;
+  }
+  /** 给早期登记（prompt 为空）的子代理补任务文本：新增一版配置，不改旧版本。 */
+  backfillSubagentPrompt(memberId, prompt) {
+    const text4 = String(prompt || "").trim().slice(0, 8192);
+    if (!text4) return;
+    const member = this.db.prepare("SELECT id, current_version, owner_human_id, status FROM member WHERE id = ?").get(memberId);
+    if (!member || member.status === "retired") return;
+    const current = this.db.prepare("SELECT * FROM member_version WHERE member_id = ? AND version = ?").get(memberId, member.current_version);
+    if (!current || String(current.prompt || "").trim()) return;
+    const at = this.now();
+    const version = Number(member.current_version || 0) + 1;
+    const digest = createHash10("sha256").update(`${memberId}
+${text4}`).digest("hex").slice(0, 16);
+    this.db.prepare(
+      `INSERT INTO member_version
+           (id, member_id, version, agent_preset, model, memory_scope_json, prompt, prompt_digest,
+            change_class, published_by, published_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'minor', ?, ?)`
+    ).run(this.id(), memberId, version, current.agent_preset ?? "hams-bot", current.model ?? null, current.memory_scope_json ?? "{}", text4, digest, member.owner_human_id, at);
+    this.db.prepare("INSERT INTO member_version_skill (member_version_id, skill_id, skill_version_id) SELECT ?, skill_id, skill_version_id FROM member_version_skill WHERE member_version_id = ?").run(
+      this.id(),
+      current.id
+    );
+    this.db.prepare("UPDATE member SET current_version = ?, updated_at = ? WHERE id = ?").run(version, at, memberId);
+  }
+  /** 轻量补登记：扫最近会话里 origin=subagent 且有 HAMS 父会话的，10 秒最多一次。 */
+  async discoverSubagents() {
+    if (!this.runtime.listSessions || !this.runtime.readSessionEvents) return;
+    const now = this.now();
+    if (now - this.lastSubagentScan < 1e4) return;
+    this.lastSubagentScan = now;
+    const sessions = await this.runtime.listSessions();
+    const cutoff = now - 7 * 864e5;
+    let budget = 40;
+    for (const session of sessions) {
+      if (!session || session.origin !== "subagent" || !session.parentSession) continue;
+      if (!session.id || session.createdAt && session.createdAt < cutoff) continue;
+      const known = this.db.prepare("SELECT value FROM hams_meta WHERE key = ?").get(`subagent:session:${session.id}`);
+      let knownMemberId = "";
+      if (known) {
+        try {
+          knownMemberId = String(JSON.parse(known.value).memberId || "");
+        } catch {
+          knownMemberId = "";
+        }
+      }
+      if (!knownMemberId) {
+        if (!this.projectRefOfSession(session.parentSession)) continue;
+        if (budget <= 0) break;
+        budget -= 1;
+      } else {
+        const empty = this.db.prepare("SELECT 1 AS hit FROM member m JOIN member_version v ON v.member_id = m.id AND v.version = m.current_version WHERE m.id = ? AND v.prompt = ''").get(knownMemberId);
+        if (!empty) continue;
+      }
+      let label = "";
+      let prompt = "";
+      try {
+        const events = await this.runtime.readSessionEvents(session.id);
+        const descriptor = events.find((event) => event && typeof event === "object" && event.type === "subagent/descriptor");
+        label = typeof descriptor?.data?.label === "string" ? descriptor.data.label : "";
+        prompt = subagentTaskPrompt(events, session.createdAt || 0);
+      } catch {
+        label = "";
+      }
+      if (knownMemberId) this.backfillSubagentPrompt(knownMemberId, prompt);
+      else this.registerSubagent({ childSessionId: session.id, parentSessionId: session.parentSession, label, prompt });
+    }
+  }
   async team(ctx, input) {
     resolvePrincipal(this.db, ctx.principalId, this.now());
     const project = this.projectRow(input.projectId);
+    try {
+      await this.discoverSubagents();
+    } catch {
+    }
     const rows = this.teamRows(input.projectId);
     const views = [];
     for (const row of rows) {
       const isCoordinator = row.kind === "coordinator";
       const pointer = this.pointerAt(this.groupKey(input.projectId, row.memberId, isCoordinator));
+      const childSessionId = row.kind === "subagent" ? this.subagentSessionOf(row.memberId) : null;
+      const dmSessionId = this.pointer("member", row.memberId)?.sessionId ?? null;
+      const watchedSessionIds = [...new Set([pointer?.sessionId, dmSessionId, childSessionId].filter((id) => Boolean(id)))];
       let running = false;
-      if (pointer && this.runtime.available && this.runtime.status) {
-        try {
-          running = (await this.runtime.status(pointer.sessionId)).running;
-        } catch {
-          running = false;
+      if (watchedSessionIds.length && this.runtime.available) {
+        for (const sessionId of watchedSessionIds) {
+          try {
+            running = this.runtime.liveStatus ? this.runtime.liveStatus(sessionId).running : this.runtime.status ? (await this.runtime.status(sessionId)).running : false;
+          } catch {
+            running = false;
+          }
+          if (running) break;
         }
       }
+      if (!running) {
+        const activeRun = this.db.prepare("SELECT 1 AS hit FROM task_run WHERE member_id = ? AND status = 'running' LIMIT 1").get(row.memberId);
+        running = Boolean(activeRun);
+      }
+      const watchedSessionId = watchedSessionIds[0] ?? null;
       views.push({
         memberId: row.memberId,
         name: row.name,
         kind: row.kind,
         status: row.status,
         brief: row.brief,
-        sessionId: pointer?.sessionId ?? null,
+        sessionId: watchedSessionId,
         running
       });
     }
@@ -9385,9 +9731,9 @@ ${lines.join("\n")}`;
     const digest = createHash10("sha256").update(`${name2}
 ${brief}`).digest("hex").slice(0, 16);
     this.db.prepare(
-      `INSERT INTO member_version (id, member_id, version, agent_preset, model, memory_scope_json, prompt_digest, change_class, published_by, published_at)
-         VALUES (?, ?, 1, 'hams-bot', NULL, '{}', ?, 'major', ?, ?)`
-    ).run(this.id(), memberId, digest, principal.memberId, at);
+      `INSERT INTO member_version (id, member_id, version, agent_preset, model, memory_scope_json, prompt, prompt_digest, change_class, published_by, published_at)
+         VALUES (?, ?, 1, 'hams-bot', NULL, '{}', ?, ?, 'major', ?, ?)`
+    ).run(this.id(), memberId, brief, digest, principal.memberId, at);
     const grant = this.db.prepare("INSERT OR IGNORE INTO member_permission (member_id, capability, scope, granted_by, granted_at) VALUES (?, ?, ?, ?, ?)");
     for (const capability of ["work_item.execute", "work_item.claim", "evidence.append"]) {
       grant.run(memberId, capability, `project:${project.id}`, principal.memberId, at);
@@ -9479,9 +9825,33 @@ ${brief}`).digest("hex").slice(0, 16);
       authorName: humanName,
       text: text4
     });
+    let intake = null;
+    try {
+      intake = await (this.intake?.registerFromMessage({
+        projectId: input.projectId,
+        senderId: ctx.principalId,
+        text: text4,
+        messageId,
+        mentionedMemberId: mentioned.length ? first.memberId : null,
+        recent: this.recentTranscript(input.projectId, 4)
+      }) ?? null);
+    } catch {
+      intake = null;
+    }
+    const intakeNote = this.intakeNote(intake);
+    if (intake) {
+      this.appendGroupMessage({
+        projectId: input.projectId,
+        authorKind: "system",
+        authorId: "system",
+        authorName: "\u7CFB\u7EDF",
+        text: this.intakeSystemText(intake),
+        kind: "system"
+      });
+    }
     const sessionIds = [];
     for (const row of targets) {
-      sessionIds.push(await this.deliverHumanMessage(project, row, text4, humanName, mentioned.length > 0));
+      sessionIds.push(await this.deliverHumanMessage(project, row, text4, humanName, mentioned.length > 0, intakeNote));
     }
     return { messageId, sessionId: sessionIds[0], mentions: mentioned.map((row) => row.memberId) };
   }
@@ -9576,7 +9946,7 @@ ${brief}`).digest("hex").slice(0, 16);
     });
     return { ok: true, memoryId: result.memory.id, created: result.created, syncedTo: result.syncedTo };
   }
-  async deliverHumanMessage(project, row, text4, humanName, mentioned) {
+  async deliverHumanMessage(project, row, text4, humanName, mentioned, intakeNote = "") {
     if (row.status !== "active") {
       throw new HamsError("STATE_INVALID", `${row.name} \u5F53\u524D\u4E0D\u5728\u5C97\uFF0C\u63A5\u4E0D\u4E86\u8FD9\u6761\u6307\u4EE4`, { nextStep: "\u5728\u667A\u80FD\u4F53\u8BE6\u60C5\u91CC\u6062\u590D\u5B83\u5728\u5C97\uFF0C\u6216\u6362\u4E00\u4E2A bot" });
     }
@@ -9587,7 +9957,7 @@ ${brief}`).digest("hex").slice(0, 16);
     const { sessionId } = await this.ensureGroupSession(project, member, isCoordinator, context);
     const transcript = this.recentTranscript(project.id, 10);
     const prefix = mentioned ? `[\u4EBA\u7C7B ${humanName} @\u4F60]` : `[\u4EBA\u7C7B ${humanName}]`;
-    const instruction = isCoordinator ? "\uFF08\u4F60\u662F\u63A8\u8FDB bot\u3002\u6D3E\u6D3B\u5FC5\u987B\u7528 hams_group_send\uFF0C\u5E76\u5728 text \u5F00\u5934\u5199\u300C@\u6210\u5458\u540D\u300D\uFF0C\u8BA9\u7FA4\u91CC\u770B\u5F97\u89C1\u4F60\u70B9\u4E86\u8C01\uFF1B\u81EA\u5DF1\u7684\u5224\u65AD\u53EF\u4EE5\u76F4\u63A5\u56DE\u7B54\uFF0C\u4E0D\u8981@\u4E0D\u5B58\u5728\u7684\u4EBA\uFF1B\u5173\u5355\u4E0E\u5BA1\u6279\u53EA\u80FD\u7531\u4EBA\u505A\u3002\uFF09" : "\uFF08\u4F60\u88AB\u4EBA\u7C7B\u70B9\u540D\u4E86\u3002\u76F4\u63A5\u56DE\u7B54\u8FD9\u6761\u6307\u4EE4\uFF1B\u9700\u8981\u522B\u4EBA\u7EE7\u7EED\u7528 hams_group_send\uFF1B\u5173\u5355\u4E0E\u5BA1\u6279\u53EA\u80FD\u7531\u4EBA\u505A\uFF0C\u4E0D\u8981\u7F16\u9020\u6CA1\u8BB0\u5F55\u8FC7\u7684\u4E8B\u3002\uFF09";
+    const instruction = isCoordinator ? "\uFF08\u4F60\u662F\u63A8\u8FDB bot\u3002\u6D3E\u6D3B\u5FC5\u987B\u7528 hams_group_send\uFF0C\u5E76\u5728 text \u5F00\u5934\u5199\u300C@\u6210\u5458\u540D\u300D\uFF0C\u8BA9\u7FA4\u91CC\u770B\u5F97\u89C1\u4F60\u70B9\u4E86\u8C01\uFF1B\u7CFB\u7EDF\u5DF2\u767B\u8BB0\u5DE5\u4F5C\u9879\u65F6\u76F4\u63A5\u7528\u5B83\u7684 id \u6D3E\u7ED9\u6210\u5458\uFF1B\u7CFB\u7EDF\u6CA1\u767B\u8BB0\u3001\u4F60\u5224\u65AD\u662F\u65B0\u6D3B\u65F6\u624D\u7528 hams_create_work_item \u8865\u5EFA\uFF1B\u81EA\u5DF1\u7684\u5224\u65AD\u53EF\u4EE5\u76F4\u63A5\u56DE\u7B54\uFF0C\u4E0D\u8981@\u4E0D\u5B58\u5728\u7684\u4EBA\uFF1B\u5173\u5355\u4E0E\u5BA1\u6279\u53EA\u80FD\u7531\u4EBA\u505A\u3002\uFF09" : "\uFF08\u4F60\u88AB\u4EBA\u7C7B\u70B9\u540D\u4E86\u3002\u76F4\u63A5\u56DE\u7B54\u8FD9\u6761\u6307\u4EE4\uFF1B\u9700\u8981\u522B\u4EBA\u7EE7\u7EED\u7528 hams_group_send\uFF1B\u5173\u5355\u4E0E\u5BA1\u6279\u53EA\u80FD\u7531\u4EBA\u505A\uFF0C\u4E0D\u8981\u7F16\u9020\u6CA1\u8BB0\u5F55\u8FC7\u7684\u4E8B\u3002\uFF09";
     const memory = projectMemoryBlock(this.db, project.id);
     await this.runtime.send(
       sessionId,
@@ -9598,7 +9968,7 @@ ${memory ? `${memory}
 ` : ""}\u3010\u7FA4\u804A\u6700\u8FD1\u8BB0\u5F55\u3011
 ${transcript}
 
-${prefix} ${text4}
+${intakeNote}${prefix} ${text4}
 
 ${instruction}`
     );
@@ -9607,7 +9977,8 @@ ${instruction}`
   coordinatorContext(project, roster) {
     return `\u4F60\u5728 HAMS \u9879\u76EE\u300A${project.name}\u300B\uFF08projectId=${project.id}\uFF09\u7684\u7FA4\u804A\u91CC\uFF0C\u662F\u8FD9\u4E2A\u9879\u76EE\u7684\u63A8\u8FDB bot\u3002
 ${roster}
-\u4F60\u53EF\u4EE5\uFF1A\u770B\u9879\u76EE\u5DE5\u4F5C\u9879\uFF08hams_list_project_work\uFF09\u3001\u6307\u6D3E\u4EFB\u52A1\uFF08hams_assign_task\uFF09\u3001@ \u7FA4\u6210\u5458\uFF08hams_group_send \u5E26 memberId\uFF09\u3001\u5EFA\u4E34\u65F6 bot\uFF08hams_group_spawn_bot\uFF0C\u53EA\u5C5E\u4E8E\u8FD9\u4E2A\u9879\u76EE\u7FA4\uFF09\u3001\u8BB0\u9879\u76EE\u8BB0\u5FC6\uFF08hams_remember\uFF09\u3002\u5173\u5355\u4E0E\u5BA1\u6279\u53EA\u80FD\u7531\u4EBA\u505A\u3002\u7528\u4E2D\u6587\u7B80\u77ED\u56DE\u7B54\u3002
+\u4F60\u53EF\u4EE5\uFF1A\u770B\u9879\u76EE\u5DE5\u4F5C\u9879\uFF08hams_list_project_work\uFF09\u3001\u5728\u672C\u9879\u76EE\u5EFA\u5DE5\u4F5C\u9879\uFF08hams_create_work_item\uFF0CprojectId \u7528\u4E0A\u9762\u7684\uFF09\u3001\u6307\u6D3E\u4EFB\u52A1\uFF08hams_assign_task\uFF09\u3001@ \u7FA4\u6210\u5458\uFF08hams_group_send \u5E26 memberId\uFF09\u3001\u5EFA\u4E34\u65F6 bot\uFF08hams_group_spawn_bot\uFF0C\u53EA\u5C5E\u4E8E\u8FD9\u4E2A\u9879\u76EE\u7FA4\uFF09\u3001\u8BB0\u9879\u76EE\u8BB0\u5FC6\uFF08hams_remember\uFF09\u3002\u5173\u5355\u4E0E\u5BA1\u6279\u53EA\u80FD\u7531\u4EBA\u505A\u3002\u7528\u4E2D\u6587\u7B80\u77ED\u56DE\u7B54\u3002
+\u4EBA\u7C7B\u7684\u65B0\u6D3B\u4F1A\u7531\u7CFB\u7EDF\u81EA\u52A8\u767B\u8BB0\u6210\u5DE5\u4F5C\u9879\uFF0C\u6D88\u606F\u91CC\u4F1A\u7ED9\u51FA\u5DE5\u4F5C\u9879 id\uFF1B\u4F18\u5148\u7528\u90A3\u6761\u5DE5\u4F5C\u9879\u6D3E\u6D3B\u3002\u53EA\u6709\u7CFB\u7EDF\u6CA1\u767B\u8BB0\u3001\u800C\u4F60\u8BA4\u4E3A\u786E\u5B9E\u8FD8\u7F3A\u4E00\u6761\u65F6\uFF0C\u624D\u7528 hams_create_work_item \u8865\u5EFA\uFF08\u540C\u6807\u9898\u81EA\u52A8\u53BB\u91CD\uFF09\u3002
 \u9047\u5230\u51B3\u5B9A\u3001\u504F\u597D\u3001\u6559\u8BAD\u3001\u53E3\u5F84\u6216 bot \u80FD\u529B\u7ECF\u9A8C\uFF0C\u7528 hams_remember \u8BB0\u4E0B\u6765\uFF1B\u80FD\u529B\u7C7B\u4F1A\u540C\u6B65\u7ED9\u5BF9\u5E94 bot\u3002
 ` + (projectMemoryBlock(this.db, project.id) ? `${projectMemoryBlock(this.db, project.id)}
 ` : "") + "\u786C\u89C4\u5219\uFF1A\u6D3E\u6D3B\u7ED9\u8C01\uFF0C\u5C31\u5728\u7FA4\u804A\u6B63\u6587\u91CC\u5199\u51FA\u300C@\u540D\u5B57\u300D\uFF1Bhams_group_send \u4F1A\u81EA\u52A8\u8865\u4E0A\u5F00\u5934\u7684 @\u540D\u5B57\uFF0C\u6240\u4EE5\u8C03\u7528\u5B83\u65F6 text \u76F4\u63A5\u5199\u4EFB\u52A1\u5185\u5BB9\u5373\u53EF\uFF0C\u4F46\u6700\u7EC8\u7FA4\u91CC\u5FC5\u987B\u80FD\u770B\u5230\u4F60\u70B9\u4E86\u8C01\u3002";
@@ -9615,7 +9986,7 @@ ${roster}
   memberContext(project, roster) {
     return `\u4F60\u5728 HAMS \u9879\u76EE\u300A${project.name}\u300B\u7684\u7FA4\u804A\u91CC\uFF0C\u662F\u7FA4\u91CC\u7684\u4E00\u540D bot \u6210\u5458\u3002
 ${roster}
-\u88AB @ \u65F6\u4F60\u4F1A\u6536\u5230\u5E26\u4E0A\u4E0B\u6587\u7684\u6307\u4EE4\uFF1B\u56DE\u590D\u76F4\u63A5\u8BF4\u8BDD\u5373\u53EF\uFF0C\u4F1A\u88AB\u5408\u5E76\u8FDB\u7FA4\u804A\u8BB0\u5F55\u3002\u9700\u8981\u5176\u4ED6\u6210\u5458\u65F6\u7528 hams_group_send\uFF0C\u6B63\u6587\u540C\u6837\u8981\u5199\u51FA\u300C@\u540D\u5B57\u300D\u3002\u4E0D\u8981\u66FF\u63A8\u8FDB bot \u6D3E\u6D3B\uFF0C\u4E5F\u4E0D\u8981\u6279\u51C6\u5173\u5355\u3002` + (projectMemoryBlock(this.db, project.id) ? `
+\u88AB @ \u65F6\u4F60\u4F1A\u6536\u5230\u5E26\u4E0A\u4E0B\u6587\u7684\u6307\u4EE4\uFF1B\u56DE\u590D\u76F4\u63A5\u8BF4\u8BDD\u5373\u53EF\uFF0C\u4F1A\u88AB\u5408\u5E76\u8FDB\u7FA4\u804A\u8BB0\u5F55\u3002\u9700\u8981\u5176\u4ED6\u6210\u5458\u65F6\u7528 hams_group_send\uFF0C\u6B63\u6587\u540C\u6837\u8981\u5199\u51FA\u300C@\u540D\u5B57\u300D\u3002\u7CFB\u7EDF\u4F1A\u81EA\u52A8\u767B\u8BB0\u65B0\u6D3B\uFF1B\u9700\u8981\u989D\u5916\u5EFA\u4EFB\u52A1\u65F6\u7528 hams_create_work_item\uFF08\u6709\u6743\u9650\u65F6\uFF09\u6216\u8BF7\u63A8\u8FDB bot \u5EFA\u5355\uFF1B\u4E0D\u8981\u66FF\u63A8\u8FDB bot \u6D3E\u6D3B\uFF0C\u4E5F\u4E0D\u8981\u6279\u51C6\u5173\u5355\u3002` + (projectMemoryBlock(this.db, project.id) ? `
 ${projectMemoryBlock(this.db, project.id)}` : "");
   }
   /** 工具路径：以某个会话的身份在群里发言（@ 某个成员）。 */
@@ -9739,37 +10110,182 @@ ${transcript}
 import path7 from "node:path";
 import { mkdir } from "node:fs/promises";
 import { randomUUID as randomUUID2 } from "node:crypto";
+
+// src/host/bot-preset.ts
+import { createHash as createHash11 } from "node:crypto";
 var HAMS_BOT_PRESET = "hams-bot";
-var HAMS_BOT_PRESET_DEFINITION = {
-  id: HAMS_BOT_PRESET,
-  name: "HAMS bot",
-  description: "HAMS \u5DE5\u4F5C\u9879\u6267\u884C\u4F53\uFF1A\u6CA1\u6709 shell\u3001\u6587\u4EF6\u5199\u3001\u59D4\u6D3E\u4E0E\u8054\u7F51\uFF0C\u53EA\u7528\u5BBF\u4E3B\u5168\u5C40\u5DE5\u5177\uFF08\u542B HAMS \u7A84\u8BED\u4E49\u5DE5\u5177\uFF09",
-  order: 90,
-  plugins: [
-    {
-      id: "persona",
-      name: "@deepseek-ai/dsh-persona",
-      config: {
-        prefix: "You are a HAMS work-item agent. Facts about the work item come from the HAMS tools; never invent state or close a work item yourself. Answer the human in Chinese, briefly. When the human is chatting in a project group, you are the coordinator: you may break work into tasks and assign them to other bots via the HAMS tools."
+var PLAN_MODE_SECTION = String.raw`You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.`;
+var HAMS_PERSONA_BASE = "You are a HAMS work-item agent. Facts about the work item come from the HAMS tools; never invent state or close a work item yourself. Answer the human in Chinese, briefly. When the human is chatting in a project group, you are the coordinator: you may break work into tasks and assign them to other bots via the HAMS tools. When a concrete deliverable is requested, register it as a HAMS work item with hams_create_work_item before doing the work; never just promise in chat without creating the item.";
+var STANDARD_TOOL_PLUGINS = [
+  {
+    id: "agent-instructions",
+    name: "@deepseek-ai/dsh-agent-instructions",
+    config: { maxBytes: 65536 }
+  },
+  { id: "time-context", name: "@deepseek-ai/dsh-time-context" },
+  { id: "tool-bash", name: "@deepseek-ai/dsh-tool-bash" },
+  {
+    id: "tool-fs",
+    name: "@deepseek-ai/dsh-tool-fs",
+    config: { applyPatch: false }
+  },
+  {
+    id: "tool-fs-search",
+    name: "@deepseek-ai/dsh-tool-fs-search",
+    config: { sampleOverCapGlobResults: false }
+  },
+  { id: "tool-jobs", name: "@deepseek-ai/dsh-tool-jobs" },
+  { id: "tool-schedule", name: "@deepseek-ai/dsh-tool-schedule" },
+  { id: "skill-filesystem", name: "@deepseek-ai/dsh-skill-filesystem" },
+  { id: "tool-skill", name: "@deepseek-ai/dsh-tool-skill" },
+  { id: "command-goal", name: "@deepseek-ai/dsh-command-goal" },
+  { id: "tool-goal", name: "@deepseek-ai/dsh-tool-goal" },
+  {
+    id: "planning",
+    name: "cordis:group",
+    group: true,
+    isolate: { planMode: true },
+    config: [{ id: "plan-mode", name: "@deepseek-ai/dsh-plan-mode", config: { section: PLAN_MODE_SECTION } }]
+  },
+  {
+    id: "compaction",
+    name: "cordis:group",
+    group: true,
+    isolate: { compaction: true, toolResultPruner: true },
+    config: [
+      { id: "compaction-basic", name: "@deepseek-ai/dsh-compaction-basic" },
+      { id: "command-compact", name: "@deepseek-ai/dsh-command-compact" },
+      {
+        id: "tool-result-pruner",
+        name: "@deepseek-ai/dsh-compaction-tool-result-pruner",
+        config: { thresholdChars: 8192, headChars: 4096, tailChars: 1024 }
       }
-    },
-    {
-      id: "compaction",
-      name: "cordis:group",
-      group: true,
-      isolate: { compaction: true, toolResultPruner: true },
-      config: [
-        { id: "compaction-basic", name: "@deepseek-ai/dsh-compaction-basic" },
-        { id: "command-compact", name: "@deepseek-ai/dsh-command-compact" },
-        {
-          id: "tool-result-pruner",
-          name: "@deepseek-ai/dsh-compaction-tool-result-pruner",
-          config: { thresholdChars: 8192, headChars: 4096, tailChars: 1024 }
-        }
-      ]
+    ]
+  },
+  {
+    id: "delegation",
+    name: "cordis:group",
+    group: true,
+    isolate: { workflowEngine: true },
+    config: [
+      { id: "tool-subagent-control", name: "@deepseek-ai/dsh-tool-subagent-control" },
+      {
+        id: "tool-subagent",
+        name: "@deepseek-ai/dsh-tool-subagent",
+        config: { provider: "spawn", toolName: "subagent", modelSelection: true, modelDiscovery: true }
+      },
+      { id: "tool-subagent-fork", name: "@deepseek-ai/dsh-tool-subagent", config: { provider: "fork", toolName: "subagent_fork" } },
+      { id: "workflow-ptc", name: "@deepseek-ai/dsh-workflow-ptc", config: { provider: "spawn" } },
+      { id: "tool-workflow", name: "@deepseek-ai/dsh-tool-workflow" }
+    ]
+  },
+  { id: "tool-ask-user", name: "@deepseek-ai/dsh-tool-ask-user" },
+  { id: "tool-todo", name: "@deepseek-ai/dsh-tool-todo", config: { allowParallelInProgress: true } },
+  { id: "tool-web", name: "@deepseek-ai/dsh-tool-web", config: { fetch: true, searchTimeoutMs: 6e4 } },
+  { id: "present", name: "@deepseek-ai/dsh-tool-present" }
+];
+function templateSafe(text4) {
+  return text4.replace(/\{\{/g, "{ {").replace(/\}\}/g, "} }");
+}
+function hamsPersonaPrefix(prompt) {
+  const text4 = String(prompt || "").trim();
+  if (!text4) return HAMS_PERSONA_BASE;
+  return `${HAMS_PERSONA_BASE}
+
+\u3010\u4F60\u7684\u8BBE\u5B9A\uFF08\u7531\u6210\u5458\u914D\u7F6E\u53D1\u5E03\uFF1B\u4E0E\u4E0A\u9762\u7684\u901A\u7528\u8BF4\u660E\u51B2\u7A81\u65F6\u4EE5\u8FD9\u91CC\u4E3A\u51C6\uFF09\u3011
+${templateSafe(text4)}`;
+}
+function presetSafeId(value) {
+  return String(value || "bot").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "bot";
+}
+function botPresetId(memberId, version, prompt) {
+  const digest = createHash11("sha256").update(String(prompt || "")).digest("hex").slice(0, 8);
+  return `${HAMS_BOT_PRESET}-${presetSafeId(memberId)}-v${Number(version) || 0}-${digest}`;
+}
+function hamsBotPresetDefinition(options = {}) {
+  const id = options.id || HAMS_BOT_PRESET;
+  const perBot = Boolean(String(options.prompt || "").trim());
+  return {
+    id,
+    name: perBot ? `HAMS bot \xB7 ${options.memberName || id}` : "HAMS bot",
+    description: perBot ? "HAMS \u5DE5\u4F5C\u9879/\u7FA4\u804A\u6267\u884C\u4F53\uFF1A\u5DE5\u5177\u4E0E\u5B98\u65B9 standard preset \u5BF9\u9F50\uFF0C\u4EBA\u8BBE\u6765\u81EA\u8FD9\u4E2A bot \u7684\u63D0\u793A\u8BCD" : "HAMS \u5DE5\u4F5C\u9879/\u7FA4\u804A\u6267\u884C\u4F53\uFF1A\u5DE5\u5177\u4E0E\u5B98\u65B9 standard preset \u5BF9\u9F50\uFF08bash / \u6587\u4EF6 / subagent / \u8054\u7F51 / \u6280\u80FD / \u4EA4\u4ED8\u5361\u7247\uFF09",
+    order: 90,
+    plugins: [
+      {
+        id: "persona",
+        name: "@deepseek-ai/dsh-persona",
+        config: { prefix: hamsPersonaPrefix(options.prompt) }
+      },
+      ...STANDARD_TOOL_PLUGINS
+    ]
+  };
+}
+function registryOf(ctx) {
+  try {
+    const found = ctx.get ? ctx.get("agentPresets") : void 0;
+    return found && typeof found === "object" ? found : void 0;
+  } catch {
+    return void 0;
+  }
+}
+var registered = /* @__PURE__ */ new Set();
+var pending = /* @__PURE__ */ new Map();
+async function registerPreset(ctx, definition, log) {
+  const note = log || (() => {
+  });
+  if (registered.has(definition.id)) return definition.id;
+  const registry = registryOf(ctx);
+  if (!registry) return null;
+  try {
+    const list = await registry.list();
+    if (Array.isArray(list) && list.some((row) => row && row.id === definition.id)) {
+      const resolved2 = await registry.resolve(definition.id);
+      if (resolved2 && resolved2.broken) {
+        note(`[hams] agent preset ${definition.id} \u4E0D\u53EF\u7528\uFF1A${resolved2.broken}`);
+        return null;
+      }
+      registered.add(definition.id);
+      return definition.id;
     }
-  ]
-};
+    await registry.register(definition);
+    const resolved = await registry.resolve(definition.id);
+    if (resolved && resolved.broken) {
+      note(`[hams] agent preset ${definition.id} \u4E0D\u53EF\u7528\uFF1A${resolved.broken}`);
+      return null;
+    }
+    registered.add(definition.id);
+    note(`[hams] \u5DF2\u6CE8\u518C agent preset ${definition.id}`);
+    return definition.id;
+  } catch (error) {
+    note(`[hams] \u6CE8\u518C ${definition.id} \u5931\u8D25\uFF0C\u9000\u56DE\u5BBF\u4E3B\u9ED8\u8BA4 preset\uFF1A${String(error)}`);
+    return null;
+  }
+}
+function resolveBotPreset(ctx, input, log) {
+  const requested = String(input.preset || "").trim();
+  if (requested && requested !== HAMS_BOT_PRESET) return Promise.resolve(requested);
+  const id = botPresetId(input.memberId, input.version, input.prompt);
+  const existing = pending.get(id);
+  if (existing) return existing;
+  const definition = hamsBotPresetDefinition({ id, memberName: input.memberName, prompt: input.prompt });
+  const task = registerPreset(ctx, definition, log).finally(() => {
+    pending.delete(id);
+  });
+  pending.set(id, task);
+  return task;
+}
+
+// src/host/chat-runtime.ts
 function chatMessagesFromEvents(events) {
   const messages = [];
   const openTurns = /* @__PURE__ */ new Set();
@@ -9855,46 +10371,6 @@ async function parseModelChoice(value, llmService, fallbackProvider) {
   }
   return { provider: fallbackProvider, model: raw };
 }
-var presetPromise = null;
-function ensureHamsBotPreset(ctx, log) {
-  if (presetPromise) return presetPromise;
-  const note = log || (() => {
-  });
-  presetPromise = (async () => {
-    const registry = (() => {
-      try {
-        const found = ctx.get ? ctx.get("agentPresets") : void 0;
-        return found && typeof found === "object" ? found : void 0;
-      } catch {
-        return void 0;
-      }
-    })();
-    if (!registry) return null;
-    try {
-      const list = await registry.list();
-      if (Array.isArray(list) && list.some((row) => row && row.id === HAMS_BOT_PRESET)) {
-        const resolved2 = await registry.resolve(HAMS_BOT_PRESET);
-        if (resolved2 && resolved2.broken) {
-          note(`[hams] agent preset ${HAMS_BOT_PRESET} \u4E0D\u53EF\u7528\uFF1A${resolved2.broken}`);
-          return null;
-        }
-        return HAMS_BOT_PRESET;
-      }
-      await registry.register(HAMS_BOT_PRESET_DEFINITION);
-      const resolved = await registry.resolve(HAMS_BOT_PRESET);
-      if (resolved && resolved.broken) {
-        note(`[hams] agent preset ${HAMS_BOT_PRESET} \u4E0D\u53EF\u7528\uFF1A${resolved.broken}`);
-        return null;
-      }
-      note(`[hams] \u5DF2\u6CE8\u518C agent preset ${HAMS_BOT_PRESET}`);
-      return HAMS_BOT_PRESET;
-    } catch (error) {
-      note(`[hams] \u6CE8\u518C ${HAMS_BOT_PRESET} \u5931\u8D25\uFF0C\u9000\u56DE\u5BBF\u4E3B\u9ED8\u8BA4 preset\uFF1A${String(error)}`);
-      return null;
-    }
-  })();
-  return presetPromise;
-}
 function safeSegment(value) {
   return String(value || "default").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "default";
 }
@@ -9942,7 +10418,13 @@ function createHostChatRuntime(options) {
     const parsedModel = await resolveAgentOptions(input.model, llm(), defaultModelService()?.currentSelection?.());
     if (!parsedModel) throw new Error("\u8FD9\u4E2A bot \u6CA1\u6709\u914D\u7F6E\u6A21\u578B\uFF0C\u5BBF\u4E3B\u4E5F\u6CA1\u6709\u9ED8\u8BA4\u6A21\u578B\uFF1B\u8BF7\u7ED9 bot \u9009\u4E00\u4E2A\u6A21\u578B\u6216\u8BBE\u7F6E\u5BBF\u4E3B\u9ED8\u8BA4\u6A21\u578B");
     const agentOptions = Object.fromEntries(Object.entries(parsedModel).filter(([, value]) => value !== void 0 && value !== ""));
-    const presetId = input.preset === HAMS_BOT_PRESET ? await ensureHamsBotPreset(ctx, log) : input.preset;
+    const presetId = await resolveBotPreset(ctx, {
+      memberId: input.memberId,
+      memberName: input.memberName,
+      version: input.memberVersion,
+      prompt: input.prompt,
+      preset: input.preset
+    }, log);
     const cwd = path7.resolve(dataDir, "bots", input.memberId, "chats", safeSegment(input.cwdKey || "default"));
     const base = path7.resolve(dataDir, "bots") + path7.sep;
     if (!cwd.startsWith(base)) throw new Error("bot \u5DE5\u4F5C\u76EE\u5F55\u8D8A\u754C");
@@ -9965,9 +10447,9 @@ function createHostChatRuntime(options) {
   function handleFor(sessionId, input) {
     const existing = handles.get(sessionId);
     if (existing) return existing;
-    const pending = openings.get(sessionId);
-    if (pending) return pending;
-    const opening = openSession({ sessionId, memberId: input.memberId, preset: input.preset, model: input.model, context: input.context });
+    const pending2 = openings.get(sessionId);
+    if (pending2) return pending2;
+    const opening = openSession({ sessionId, ...input });
     openings.set(sessionId, opening);
     return opening.then((handle) => {
       handles.set(sessionId, Promise.resolve(handle));
@@ -9985,21 +10467,22 @@ function createHostChatRuntime(options) {
     },
     async ensure(input) {
       if (closed) throw new Error("\u5BF9\u8BDD\u8FD0\u884C\u65F6\u5DF2\u505C\u6B62");
+      const info = {
+        memberId: input.memberId,
+        memberName: input.memberName,
+        memberVersion: input.memberVersion,
+        prompt: input.prompt || "",
+        preset: input.agentPreset || HAMS_BOT_PRESET,
+        model: input.model
+      };
       if (input.sessionId) {
-        meta.set(input.sessionId, { memberId: input.memberId, preset: input.agentPreset || HAMS_BOT_PRESET, model: input.model });
-        await handleFor(input.sessionId, { ...meta.get(input.sessionId), context: input.context });
+        meta.set(input.sessionId, info);
+        await handleFor(input.sessionId, { ...info, context: input.context });
         return { sessionId: input.sessionId };
       }
-      const presetId = input.agentPreset || HAMS_BOT_PRESET;
-      const handle = await openSession({
-        memberId: input.memberId,
-        preset: presetId,
-        model: input.model,
-        cwdKey: input.key,
-        context: input.context
-      });
+      const handle = await openSession({ ...info, cwdKey: input.key, context: input.context });
       const sessionId = handle.agent.session.id;
-      meta.set(sessionId, { memberId: input.memberId, preset: presetId, model: input.model });
+      meta.set(sessionId, info);
       handles.set(sessionId, Promise.resolve(handle));
       return { sessionId };
     },
@@ -10013,6 +10496,10 @@ function createHostChatRuntime(options) {
         content: [{ type: "text", text: text4 }],
         source: { kind: "user" }
       });
+    },
+    liveStatus(sessionId) {
+      const live = agents()?.get?.(sessionId);
+      return { live: Boolean(live), running: Boolean(live && live.status === "running") };
     },
     async status(sessionId) {
       const live = agents()?.get?.(sessionId);
@@ -10048,9 +10535,9 @@ function createHostChatRuntime(options) {
       return { messages: scanned.messages, running: status ? status === "running" : scanned.running, ...scanned.error ? { error: scanned.error } : {} };
     },
     async stop(sessionId) {
-      const pending = handles.get(sessionId);
-      if (!pending) return;
-      const handle = await pending;
+      const pending2 = handles.get(sessionId);
+      if (!pending2) return;
+      const handle = await pending2;
       handle.agent.cancel({ kind: "user" }, { keepInbox: true });
     },
     async defaultModel() {
@@ -10063,7 +10550,7 @@ function createHostChatRuntime(options) {
       if (!registry) return [];
       try {
         const list = await registry.list();
-        return Array.isArray(list) ? list.filter((row) => row && row.id) : [];
+        return Array.isArray(list) ? list.filter((row) => row && row.id && !row.id.startsWith(`${HAMS_BOT_PRESET}-`)) : [];
       } catch (error) {
         log(`[hams] \u8BFB preset \u76EE\u5F55\u5931\u8D25\uFF1A${String(error)}`);
         return [];
@@ -10098,11 +10585,39 @@ function createHostChatRuntime(options) {
       modelsCache = { at: now, rows };
       return rows;
     },
+    async listSessions() {
+      const query = sessionQuery();
+      if (!query || typeof query.listSessions !== "function") return [];
+      try {
+        const rows = await query.listSessions();
+        return (Array.isArray(rows) ? rows : []).map((row) => row?.header).filter((header) => Boolean(header && header.id)).map((header) => ({
+          id: String(header.id),
+          ...header.parentSession ? { parentSession: String(header.parentSession) } : {},
+          ...header.origin === "subagent" ? { origin: "subagent" } : {},
+          createdAt: Number(header.createdAt) || 0,
+          ...header.cwd ? { cwd: String(header.cwd) } : {}
+        }));
+      } catch (error) {
+        log(`[hams] \u5217\u4F1A\u8BDD\u5931\u8D25\uFF1A${String(error)}`);
+        return [];
+      }
+    },
+    async readSessionEvents(sessionId) {
+      const query = sessionQuery();
+      if (!query) return [];
+      try {
+        const snapshot = await query.readSession(sessionId);
+        return snapshot && Array.isArray(snapshot.events) ? snapshot.events : [];
+      } catch (error) {
+        log(`[hams] \u8BFB\u4F1A\u8BDD ${sessionId} \u5931\u8D25\uFF1A${String(error)}`);
+        return [];
+      }
+    },
     async dispose() {
       closed = true;
-      for (const pending of [...handles.values(), ...openings.values()]) {
+      for (const pending2 of [...handles.values(), ...openings.values()]) {
         try {
-          const handle = await pending;
+          const handle = await pending2;
           await handle.dispose();
         } catch {
         }
@@ -10123,6 +10638,8 @@ function buildRunFacts(db, runId, now = Date.now(), timeZone = "Asia/Shanghai") 
   if (!run) throw new HamsError("STATE_INVALID", `\u8FD0\u884C\u4E0D\u5B58\u5728\uFF1A${runId}`);
   const item = db.prepare("SELECT * FROM work_item WHERE id=?").get(run.work_item_id);
   const template = item.template_version_id ? db.prepare("SELECT * FROM work_template_version WHERE id=?").get(item.template_version_id) : null;
+  const version = db.prepare("SELECT prompt, agent_preset FROM member_version WHERE member_id=? AND version=?").get(run.member_id, run.member_version);
+  const botPrompt = version && version.agent_preset && version.agent_preset !== HAMS_BOT_PRESET ? String(version.prompt || "").trim() : "";
   const date = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(now));
   const utc = /* @__PURE__ */ new Date(`${date}T00:00:00Z`);
   utc.setUTCDate(utc.getUTCDate() - (utc.getUTCDay() + 6) % 7);
@@ -10133,7 +10650,7 @@ function buildRunFacts(db, runId, now = Date.now(), timeZone = "Asia/Shanghai") 
   return {
     stateAndEpoch: { workItemId: item.id, status: item.status, revision: item.revision, executionEpoch: item.execution_epoch, fence: run.fence, runtimeEpoch: run.runtime_epoch },
     evidenceAndHashes: { evidenceSetHash: item.evidence_set_hash, evidence: db.prepare("SELECT id,kind,ref,content_hash,observed_at,source FROM evidence WHERE work_item_id=? AND status='active' ORDER BY id").all(item.id) },
-    taskAndCriteria: { runId, trigger: run.trigger, checkId: run.check_id, title: item.title, memberVersion: run.member_version, templateVersion: template ?? null },
+    taskAndCriteria: { runId, trigger: run.trigger, checkId: run.check_id, title: item.title, memberVersion: run.member_version, templateVersion: template ?? null, ...botPrompt ? { botPrompt } : {} },
     approvalsAndBlockers: { blockedReason: item.blocked_reason, approvals: db.prepare("SELECT id,status,reason_text,expires_at FROM approval WHERE subject_kind='work_item_close' AND subject_id=? AND status='pending' ORDER BY id").all(item.id) },
     budgetAndCapabilities: {
       budgets,
@@ -10171,45 +10688,67 @@ var HamsSessionAdapter = class {
     return this.options.db.prepare("SELECT * FROM work_item_thread WHERE work_item_id=? AND status IN ('active','pending_rotate') ORDER BY generation DESC LIMIT 1").get(workItemId);
   }
   config(memberId, version) {
-    const row = this.options.db.prepare(`SELECT v.*,m.status,m.kind FROM member_version v JOIN member m ON m.id=v.member_id WHERE v.member_id=? AND v.version=${version === void 0 ? "m.current_version" : "?"}`).get(...version === void 0 ? [memberId] : [memberId, version]);
+    const row = this.options.db.prepare(`SELECT v.*,m.status,m.kind,m.name FROM member_version v JOIN member m ON m.id=v.member_id WHERE v.member_id=? AND v.version=${version === void 0 ? "m.current_version" : "?"}`).get(...version === void 0 ? [memberId] : [memberId, version]);
     if (!row || row.kind !== "bot" || row.status !== "active") throw new HamsError("HOST_CAPABILITY_MISSING", "bot \u6CA1\u6709\u6709\u6548\u4E14\u5DF2\u53D1\u5E03\u7684\u5BBF\u4E3B preset");
-    return { memberId, version: row.version, agentPreset: row.agent_preset || this.options.defaultPreset || "", model: row.model };
+    return { memberId, memberName: row.name, version: row.version, agentPreset: row.agent_preset || this.options.defaultPreset || "", model: row.model, prompt: row.prompt || "" };
   }
   needsRotation(thread) {
     return thread.status === "pending_rotate" || Boolean(this.options.db.prepare("SELECT 1 FROM member_version WHERE member_id=? AND version>? AND change_class='major'").get(thread.member_id, thread.member_version));
+  }
+  /** 宿主调用加超时：预设挂载/建会话卡住时不能让派发器永远停在 dispatching=true。 */
+  async withTimeout(promise, ms, label) {
+    let timer;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new HamsError("HOST_CAPABILITY_MISSING", `${label}\u8D85\u65F6\uFF08${ms}ms\uFF09`, { nextStep: "\u68C0\u67E5\u5BBF\u4E3B agents \u670D\u52A1\u4E0E bot preset \u662F\u5426\u53EF\u7528\uFF1B\u5FC5\u8981\u65F6\u91CD\u542F DSH" })), ms);
+        })
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
   async open(config, existing, cwdKey) {
     if (existing && this.handles.has(existing)) return this.handles.get(existing);
     const id = existing ?? (this.options.sessionId ?? (() => `session-${randomUUID3()}`))();
     if (!id.trim() || this.handles.has(id)) throw new HamsError("STATE_INVALID", "\u5BBF\u4E3B\u4F1A\u8BDD id \u91CD\u590D\u6216\u4E3A\u7A7A");
-    const pending = (async () => {
-      const composition = await this.options.compose(config);
+    const pending2 = (async () => {
+      const composition = await this.withTimeout(this.options.compose(config), 2e4, "\u7EC4\u5408 bot \u9884\u8BBE");
       const { agentPreset: composedPreset, ...rest } = composition;
       const presetId = composedPreset ?? config.agentPreset;
       const cwd = path8.resolve(this.options.dataDir, "bots", config.memberId, "work", String(cwdKey || "default").replace(/[^a-zA-Z0-9._-]+/g, "-") || "default");
       const base = path8.resolve(this.options.dataDir, "bots") + path8.sep;
       if (!cwd.startsWith(base)) throw new HamsError("POLICY_DENIED", "bot \u5DE5\u4F5C\u76EE\u5F55\u8D8A\u754C");
       await mkdir2(cwd, { recursive: true });
-      const handle = existing ? await this.options.agents.resume({ resumeSessionId: id, ...rest }) : await this.options.agents.create({ sessionId: id, meta: { cwd, ...presetId ? { agentPreset: presetId } : {} }, ...rest });
+      const opening = existing ? this.options.agents.resume({ resumeSessionId: id, ...rest }) : this.options.agents.create({ sessionId: id, meta: { cwd, ...presetId ? { agentPreset: presetId } : {} }, ...rest });
+      let handle;
+      try {
+        handle = await this.withTimeout(opening, 45e3, "\u5BBF\u4E3B\u521B\u5EFA/\u6062\u590D\u4F1A\u8BDD");
+      } catch (error) {
+        void opening.then((late) => late.dispose()).catch(() => {
+        });
+        throw error;
+      }
       if (handle.agent.session.id !== id) {
         await handle.dispose();
         throw new HamsError("HOST_CAPABILITY_MISSING", "\u5BBF\u4E3B\u8FD4\u56DE\u7684\u4F1A\u8BDD\u8EAB\u4EFD\u4E0E\u8BF7\u6C42\u4E0D\u4E00\u81F4");
       }
       return handle;
     })();
-    this.handles.set(id, pending);
+    this.handles.set(id, pending2);
     try {
-      return await pending;
+      return await pending2;
     } catch (error) {
       this.handles.delete(id);
       throw error;
     }
   }
   async release(sessionId) {
-    const pending = this.handles.get(sessionId);
-    if (!pending) return;
+    const pending2 = this.handles.get(sessionId);
+    if (!pending2) return;
     try {
-      await (await pending).dispose();
+      await (await pending2).dispose();
     } finally {
       this.handles.delete(sessionId);
     }
@@ -10366,6 +10905,145 @@ ${JSON.stringify(buildRunFacts(this.options.db, run.id, this.now(), this.options
   }
 };
 
+// src/host/dsh-adapter.ts
+import { createHash as createHash13 } from "node:crypto";
+
+// src/host/intake-agent.ts
+var DECISION_SCHEMA = `\u53EA\u8F93\u51FA\u4E00\u4E2A JSON \u5BF9\u8C61\uFF0C\u4E0D\u8981 markdown\u3001\u4E0D\u8981\u89E3\u91CA\u3002\u4E09\u79CD\u5F62\u6001\uFF1A
+{"action":"create","title":"\u4E0D\u8D85\u8FC7 60 \u5B57\u7684\u5177\u4F53\u4EFB\u52A1\u6807\u9898","reason":"\u4E00\u53E5\u8BDD"}
+{"action":"update","workItemId":"\u5FC5\u987B\u662F\u4E0B\u9762\u5217\u8868\u91CC\u7684 id","status":"paused|active|cancelled","reason":"\u4E00\u53E5\u8BDD"}
+{"action":"none","reason":"\u4E00\u53E5\u8BDD"}`;
+function buildPrompt(input) {
+  const items = input.workItems.length ? input.workItems.slice(0, 20).map((item) => `- ${item.id}\uFF5C${item.status}\uFF5C${item.assignee ? `@${item.assignee}` : "\u672A\u6307\u6D3E"}\uFF5C${item.title}`).join("\n") : "\uFF08\u5F53\u524D\u6CA1\u6709\u672A\u7ED3\u5DE5\u4F5C\u9879\uFF09";
+  const recent = input.recent ? `
+\u6700\u8FD1\u7FA4\u804A\uFF08\u4F9B\u7406\u89E3\u201C\u8FD9\u4E2A/\u521A\u624D\u201D\u6307\u4EC0\u4E48\uFF09\uFF1A
+${input.recent}
+` : "";
+  return `\u4F60\u662F HAMS \u7684\u4EFB\u52A1\u8BC6\u522B\u5668\u3002\u5224\u65AD\u4EBA\u7C7B\u8FD9\u53E5\u8BDD\u662F\u5728\u300C\u5F00\u4E00\u4EF6\u65B0\u6D3B\u300D\u8FD8\u662F\u5728\u300C\u6539\u67D0\u4E2A\u5DF2\u6709\u5DE5\u4F5C\u9879\u7684\u72B6\u6001\u300D\u3002
+
+\u9879\u76EE\uFF1A${input.projectName}
+
+\u5F53\u524D\u672A\u7ED3\u5DE5\u4F5C\u9879\uFF08id\uFF5C\u72B6\u6001\uFF5C\u8D1F\u8D23\u4EBA\uFF5C\u6807\u9898\uFF09\uFF1A
+${items}
+${recent}
+\u4EBA\u7C7B\u65B0\u6D88\u606F\uFF1A
+${input.message}
+
+\u5224\u65AD\u53E3\u5F84\uFF1A
+- \u53EA\u6709\u660E\u786E\u8981\u6C42\u505A\u4E00\u4EF6\u65B0\u7684\u3001\u53EF\u4EA4\u4ED8\u7684\u4E8B\uFF0C\u624D create\uFF1B\u5BD2\u6684\u3001\u611F\u8C22\u3001\u786E\u8BA4\u3001\u8FFD\u95EE\u8FDB\u5C55\u3001\u56DE\u7B54 bot \u7684\u95EE\u9898\u3001\u95F2\u804A\u90FD none\u3002
+- \u53EA\u6709\u660E\u786E\u8981\u6C42\u6682\u505C/\u7EE7\u7EED/\u53D6\u6D88\u67D0\u4E2A\u5DF2\u6709\u5DE5\u4F5C\u9879\uFF0C\u624D update\uFF1B\u201C\u505A\u5B8C\u4E86/\u53EF\u4EE5\u5173\u5355\u4E86\u201D\u4E0D\u662F update\uFF08\u5173\u5355\u8981\u4EBA\u5BA1\u6279\uFF09\uFF0C\u7ED9 none\u3002
+- \u4E0D\u8981\u81C6\u9020\u5DE5\u4F5C\u9879 id\uFF1B\u62FF\u4E0D\u51C6\u5C31 none\u3002
+- create \u7684\u6807\u9898\u8981\u5177\u4F53\u3001\u80FD\u76F4\u63A5\u5F53\u4EFB\u52A1\u540D\uFF0C\u4E0D\u8981\u5E26\u201C\u5E2E\u6211/\u8BF7\u201D\u3002
+
+${DECISION_SCHEMA}`;
+}
+function parseDecision(text4) {
+  const trimmed = String(text4 || "").trim();
+  if (!trimmed) return null;
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  let raw;
+  try {
+    raw = JSON.parse(trimmed.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+  if (!raw || typeof raw !== "object") return null;
+  const value = raw;
+  const action = value.action;
+  const reason = typeof value.reason === "string" ? value.reason.slice(0, 200) : "";
+  if (action === "create") {
+    const title = typeof value.title === "string" ? value.title.trim().replace(/\s+/g, " ").slice(0, 60) : "";
+    if (title.length < 4) return null;
+    return { action: "create", title, reason };
+  }
+  if (action === "update") {
+    const workItemId = typeof value.workItemId === "string" ? value.workItemId.trim() : "";
+    const status = value.status;
+    if (!workItemId || status !== "paused" && status !== "active" && status !== "cancelled") return null;
+    return { action: "update", workItemId, status, reason };
+  }
+  if (action === "none") return { action: "none", reason };
+  return null;
+}
+function hasOff(info) {
+  return Boolean(info?.reasoning?.efforts?.some((effort) => /^(off|none|no[-_]?think|minimal)$/i.test(effort.id)));
+}
+var modelChoiceCache = /* @__PURE__ */ new Map();
+function chooseIntakeModel(llm, preferred) {
+  if (preferred.reasoningEffort) return Promise.resolve(preferred);
+  const key = `${preferred.provider}/${preferred.model}`;
+  const cached = modelChoiceCache.get(key);
+  if (cached) return cached;
+  const task = (async () => {
+    if (!llm.resolveModelInfo) return preferred;
+    try {
+      const info = await llm.resolveModelInfo(preferred.provider, preferred.model);
+      if (hasOff(info)) return preferred;
+    } catch {
+      return preferred;
+    }
+    if (!llm.listModels) return preferred;
+    let catalog = [];
+    try {
+      catalog = await llm.listModels(preferred.provider);
+    } catch {
+      return preferred;
+    }
+    for (const row of catalog.slice(0, 8)) {
+      if (!row?.id || row.id === preferred.model) continue;
+      try {
+        const info = await llm.resolveModelInfo(preferred.provider, row.id);
+        if (hasOff(info)) return { provider: preferred.provider, model: row.id };
+      } catch {
+      }
+    }
+    return preferred;
+  })();
+  modelChoiceCache.set(key, task);
+  return task;
+}
+async function leastEffort(input) {
+  if (input.model.reasoningEffort) return input.model.reasoningEffort;
+  if (!input.llm.resolveModelInfo) return void 0;
+  try {
+    const info = await input.llm.resolveModelInfo(input.model.provider, input.model.model, input.signal);
+    const efforts = info?.reasoning?.efforts ?? [];
+    const off = efforts.find((effort) => /^(off|none|no[-_]?think|minimal)$/i.test(effort.id) || /off|none|不思考|无思考/i.test(effort.name));
+    return (off ?? efforts[0])?.id;
+  } catch {
+    return void 0;
+  }
+}
+async function classifyWorkRequest(input) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), input.timeoutMs ?? 1e4);
+  const signal = input.signal ? AbortSignal.any([input.signal, controller.signal]) : controller.signal;
+  try {
+    const chosen = await chooseIntakeModel(input.llm, input.model);
+    const reasoningEffort = await leastEffort({ ...input, model: chosen, signal });
+    const stream = input.llm.stream({
+      provider: chosen.provider,
+      model: chosen.model,
+      messages: [{ role: "user", content: [{ type: "text", text: buildPrompt(input) }] }],
+      maxTokens: 300,
+      ...reasoningEffort ? { reasoningEffort } : {},
+      signal
+    });
+    let text4 = "";
+    for await (const chunk of stream) {
+      if (chunk?.type === "text-delta" && typeof chunk.text === "string") text4 += chunk.text;
+      if (text4.length > 2e3) break;
+    }
+    return parseDecision(text4);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // src/service/templates.ts
 var STARTER_TEMPLATE = {
   id: "tpl-research-delivery",
@@ -10451,7 +11129,7 @@ function removeTemplateIfUnused(db, templateIdOrKey) {
 }
 
 // src/service/workspace-profile.ts
-import { createHash as createHash11 } from "node:crypto";
+import { createHash as createHash12 } from "node:crypto";
 import { readFileSync as readFileSync4, existsSync as existsSync6 } from "node:fs";
 import path9 from "node:path";
 var DAY = 864e5;
@@ -10482,7 +11160,7 @@ function defaultProfilePath(dataDir) {
 }
 function readProfile(file) {
   const raw = readFileSync4(file, "utf8");
-  const hash = createHash11("sha256").update(raw).digest("hex");
+  const hash = createHash12("sha256").update(raw).digest("hex");
   let parsed;
   try {
     parsed = JSON.parse(raw);
@@ -11071,17 +11749,142 @@ function registerHams(ctx, config = {}) {
     knowledge: { dataDir, skillDirs: knowledgeSkillDirs }
   });
   const chatRuntime = mode === "writer" ? createHostChatRuntime({ ctx, dataDir, log: (line) => ctx.logger?.warn?.(line) }) : null;
-  const chat = chatRuntime ? new ChatService({ db, runtime: chatRuntime }) : null;
-  const disposers = [];
-  const hostService = (name2) => {
-    if (typeof ctx.get !== "function") return void 0;
-    try {
-      const found = ctx.get(name2);
-      return found && typeof found === "object" ? found : void 0;
-    } catch {
-      return void 0;
+  const intake = chatRuntime && config.autoIntake !== false ? {
+    async registerFromMessage(input) {
+      const project = db.prepare("SELECT id, name, owner_human_id, status FROM project WHERE id = ? AND deleted_at IS NULL").get(input.projectId);
+      if (!project || project.status !== "active") return null;
+      const sender = db.prepare("SELECT kind, status FROM member WHERE id = ?").get(input.senderId);
+      if (!sender || sender.kind !== "human") return null;
+      const llm = hostService("llm");
+      if (!llm || typeof llm.stream !== "function") return null;
+      const selection = hostService(
+        "agentDefaultModel"
+      )?.currentSelection?.();
+      let model = null;
+      if (config.intakeModel?.trim()) {
+        const parsed = await parseModelChoice(config.intakeModel, llm, selection?.provider);
+        if (parsed?.model) model = { provider: parsed.provider || selection?.provider || "", model: parsed.model, reasoningEffort: config.intakeReasoningEffort };
+      } else if (selection?.provider && selection.model) {
+        model = { provider: selection.provider, model: selection.model, reasoningEffort: config.intakeReasoningEffort };
+      }
+      if (!model?.provider) return null;
+      const items = db.prepare(
+        `SELECT w.id, w.title, w.status, m.name AS assignee
+                 FROM work_item w LEFT JOIN member m ON m.id = w.assignee_id
+                WHERE w.project_id = ? AND w.status NOT IN ('completed','cancelled')
+                ORDER BY w.updated_at DESC LIMIT 20`
+      ).all(project.id);
+      const decision = await classifyWorkRequest({
+        llm,
+        model,
+        projectName: project.name,
+        workItems: items,
+        recent: input.recent,
+        message: input.text
+      });
+      if (!decision || decision.action === "none") return null;
+      const base = {
+        principalId: input.senderId,
+        channel: "ui",
+        correlationId: `intake:${input.messageId}`,
+        idempotencyKey: `intake:${input.messageId}`
+      };
+      if (decision.action === "create") {
+        const dedupeKey = `intake:${project.id}:${createHash13("sha256").update(decision.title.replace(/\s+/g, "")).digest("hex").slice(0, 16)}`;
+        try {
+          const receipt = service.createWorkItem(base, {
+            projectId: project.id,
+            domain: "\u901A\u7528",
+            category: "\u7FA4\u804A\u8BF7\u6C42",
+            title: decision.title,
+            ownerHumanId: input.senderId,
+            dedupeKey
+          });
+          const workItemId = String(receipt.objectId || "");
+          if (!workItemId) return null;
+          if (input.mentionedMemberId && receipt.status === "applied") {
+            try {
+              service.assignWorkItem(
+                { ...base, correlationId: `intake-assign:${input.messageId}` },
+                { workItemId, memberId: input.mentionedMemberId }
+              );
+            } catch {
+            }
+          }
+          return { kind: "create", workItemId, title: decision.title, created: receipt.status === "applied" };
+        } catch (error) {
+          ctx.logger?.warn?.(`[hams] \u8BC6\u522B\u5EFA\u5355\u5931\u8D25\uFF1A${String(error)}`);
+          return null;
+        }
+      }
+      const item = db.prepare("SELECT id, title, status FROM work_item WHERE id = ? AND project_id = ?").get(decision.workItemId, project.id);
+      if (!item || item.status === "completed" || item.status === "cancelled") return null;
+      if (item.status === decision.status) {
+        return { kind: "update", workItemId: item.id, title: item.title, status: decision.status, changed: false };
+      }
+      try {
+        const reason = `\u7FA4\u804A\u6307\u4EE4\uFF1A${input.text.slice(0, 200)}`;
+        if (decision.status === "paused") service.pause(base, { workItemId: item.id, reason });
+        else if (decision.status === "active") service.resume(base, { workItemId: item.id, reason });
+        else service.cancel(base, { workItemId: item.id, reason });
+      } catch (error) {
+        ctx.logger?.warn?.(`[hams] \u8BC6\u522B\u6539\u72B6\u6001\u5931\u8D25\uFF1A${String(error)}`);
+        return null;
+      }
+      return { kind: "update", workItemId: item.id, title: item.title, status: decision.status, changed: true };
     }
-  };
+  } : void 0;
+  const chat = chatRuntime ? new ChatService({ db, runtime: chatRuntime, intake }) : null;
+  const disposers = [];
+  if (chat && typeof ctx.on === "function") {
+    const labels = /* @__PURE__ */ new Map();
+    const textOf = (content) => {
+      if (!Array.isArray(content)) return "";
+      return content.filter((block2) => block2 && typeof block2 === "object" && block2.type === "text").map((block2) => String(block2.text ?? "")).join("\n").trim().slice(0, 8192);
+    };
+    const register = (childSessionId, parentSessionId, label, prompt) => {
+      try {
+        chat.registerSubagent({ childSessionId, parentSessionId, label, prompt });
+      } catch (error) {
+        ctx.logger?.warn?.(`[hams] \u767B\u8BB0\u5B50\u4EE3\u7406\u5931\u8D25\uFF1A${String(error)}`);
+      }
+    };
+    const off = ctx.on("session/event", (session, event) => {
+      const header = session?.header ?? session?.meta;
+      if (!header || header.origin !== "subagent" || !header.parentSession || !header.id) return;
+      if (event?.type === "subagent/descriptor") {
+        if (labels.size > 200) labels.clear();
+        labels.set(String(header.id), typeof event.data?.label === "string" ? event.data.label : "");
+        return;
+      }
+      if (event?.type !== "user/message") return;
+      if (event.data?.source?.kind !== "user") return;
+      if (Number(event.time || 0) < Number(header.createdAt || 0)) return;
+      const prompt = textOf(event.data.content);
+      if (!prompt) return;
+      const childSessionId = String(header.id);
+      const parentSessionId = String(header.parentSession);
+      const known = labels.get(childSessionId) || "";
+      if (known) {
+        register(childSessionId, parentSessionId, known, prompt);
+        labels.delete(childSessionId);
+        return;
+      }
+      void (async () => {
+        let label = "";
+        try {
+          const query = ctx.get?.("sessionQuery");
+          const events = query?.readSession ? (await query.readSession(childSessionId)).events ?? [] : [];
+          const descriptor = events.find((item) => item && typeof item === "object" && item.type === "subagent/descriptor");
+          label = typeof descriptor?.data?.label === "string" ? descriptor.data.label : "";
+        } catch {
+          label = "";
+        }
+        register(childSessionId, parentSessionId, label, prompt);
+      })();
+    });
+    if (typeof off === "function") disposers.push(off);
+  }
   let sessionAdapter = null;
   if (mode === "writer" && config.botRuntime !== false) {
     const agentsProxy = {
@@ -11104,7 +11907,11 @@ function registerHams(ctx, config = {}) {
       agents: agentsProxy,
       createUserMessage: (input) => ({ id: `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`, role: "user", ...input }),
       compose: async (bot) => {
-        const preset = bot.agentPreset && bot.agentPreset !== HAMS_BOT_PRESET ? bot.agentPreset : await ensureHamsBotPreset(ctx, (line) => ctx.logger?.warn?.(line));
+        const preset = await resolveBotPreset(
+          ctx,
+          { memberId: bot.memberId, memberName: bot.memberName, version: bot.version, prompt: bot.prompt, preset: bot.agentPreset },
+          (line) => ctx.logger?.warn?.(line)
+        );
         const selection = hostService("agentDefaultModel")?.currentSelection?.();
         const model = await resolveAgentOptions(bot.model, hostService("llm"), selection);
         if (!model) {
@@ -11151,13 +11958,30 @@ function registerHams(ctx, config = {}) {
   let dispatchTimer = null;
   if (sessionAdapter) {
     let dispatching = false;
+    const writeMeta = (key, value) => {
+      try {
+        db.prepare("INSERT OR REPLACE INTO hams_meta (key, value) VALUES (?, ?)").run(key, typeof value === "string" ? value : JSON.stringify(value));
+      } catch {
+      }
+    };
     dispatchTimer = setInterval(() => {
       if (dispatching) return;
       dispatching = true;
-      Promise.resolve().then(() => sessionAdapter.dispatchAssignments()).then((report) => {
+      const startedAt2 = Date.now();
+      writeMeta("dispatch:heartbeat", { at: startedAt2, dispatching: true });
+      const cycle = Promise.resolve().then(() => sessionAdapter.dispatchAssignments()).then((report) => {
         if (report.errors.length) ctx.logger?.warn?.(`[hams] \u6307\u6D3E\u6D3E\u53D1\u5931\u8D25\uFF1A${report.errors.slice(0, 3).join(" | ")}`);
-      }).then(() => sessionAdapter.dispatchQueued()).catch((error) => ctx.logger?.warn?.(`[hams] \u6D3E\u53D1\u5931\u8D25\uFF1A${String(error)}`)).finally(() => {
+        writeMeta("dispatch:assign", { at: Date.now(), started: report.started, errors: report.errors.slice(0, 5) });
+      }).then(() => sessionAdapter.dispatchQueued());
+      const timeout = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error("\u6D3E\u53D1\u5468\u671F\u8D85\u65F6\uFF0860s\uFF09")), 6e4);
+      });
+      Promise.race([cycle, timeout]).catch((error) => {
+        writeMeta("dispatch:error", { at: Date.now(), error: String(error) });
+        ctx.logger?.warn?.(`[hams] \u6D3E\u53D1\u5931\u8D25\uFF1A${String(error)}`);
+      }).finally(() => {
         dispatching = false;
+        writeMeta("dispatch:heartbeat", { at: Date.now(), dispatching: false });
       });
     }, Math.max(3e3, config.tickMs ?? 5e3));
     if (typeof dispatchTimer === "object" && dispatchTimer && "unref" in dispatchTimer) dispatchTimer.unref();
@@ -11170,6 +11994,12 @@ function registerHams(ctx, config = {}) {
         service,
         db,
         resolveSessionOwner: config.defaultBotMemberId ? () => ({ memberId: config.defaultBotMemberId }) : void 0,
+        onAssigned: () => {
+          if (!sessionAdapter) return;
+          void sessionAdapter.dispatchAssignments().then((report) => {
+            if (report.errors.length) ctx.logger?.warn?.(`[hams] \u6307\u6D3E\u5373\u65F6\u6D3E\u53D1\u5931\u8D25\uFF1A${report.errors.slice(0, 3).join(" | ")}`);
+          }).then(() => sessionAdapter.dispatchQueued()).catch((error) => ctx.logger?.warn?.(`[hams] \u6307\u6D3E\u5373\u65F6\u6D3E\u53D1\u5931\u8D25\uFF1A${String(error)}`));
+        },
         ...chat ? {
           chat: {
             projectOfSession: (sessionId) => chat.projectOfSession(sessionId),
@@ -11248,7 +12078,7 @@ function registerHams(ctx, config = {}) {
       "[hams] \u5BBF\u4E3B\u6CA1\u6709\u63D0\u4F9B connection \u670D\u52A1\uFF1A\u754C\u9762\u63A5\u53E3\u53EA\u9A8C Origin\uFF0C\u4E0D\u6821\u9A8C\u5BBF\u4E3B\u6D4F\u89C8\u5668\u4F1A\u8BDD\u3002\u8981\u5F3A\u5236\u6821\u9A8C\uFF0C\u628A\u914D\u7F6E hostSession \u8BBE\u4E3A require\uFF08\u6216\u5728\u5E26 Web \u8F7D\u4F53\u7684\u5BBF\u4E3B\u91CC\u8FD0\u884C\uFF09\u3002"
     );
   }
-  const registered = {
+  const registered2 = {
     mode,
     service,
     db,
@@ -11276,16 +12106,16 @@ function registerHams(ctx, config = {}) {
       void chatRuntime?.dispose();
     }
   };
-  return registered;
+  return registered2;
 }
 function applyHams(ctx, config = {}) {
   if (typeof ctx.effect === "function") {
-    let registered = null;
+    let registered2 = null;
     ctx.effect(() => {
-      registered = registerHams(ctx, config);
-      return () => registered?.dispose();
+      registered2 = registerHams(ctx, config);
+      return () => registered2?.dispose();
     }, "hams.runtime");
-    return registered;
+    return registered2;
   }
   return registerHams(ctx, config);
 }
@@ -11319,6 +12149,12 @@ var Config = z ? z.object({
   hostSession: z.union([z.const("auto"), z.const("require"), z.const("off")]).default("auto"),
   /** 知识屏扫描的真实技能目录；空 = $DSH_HOME/skills */
   knowledgeSkillDirs: z.array(z.string()).default([]),
+  /** 群聊里人类的任务请求自动登记成工作项；默认开 */
+  autoIntake: z.boolean().default(true),
+  /** 识别器模型；空 = 宿主默认模型 */
+  intakeModel: z.string().default(""),
+  /** 识别器推理强度；空 = 自动最低档 */
+  intakeReasoningEffort: z.string().default(""),
   /** 工作区画像文件；空 = $DSH_HOME/hams/workspace-profile.json */
   workspaceProfileFile: z.string().default(""),
   /** 画像里相对路径的根；空 = 读画像里的 workspaceRoot */

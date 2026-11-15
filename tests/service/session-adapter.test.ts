@@ -14,6 +14,7 @@ function setup(t: any) {
   process.env.DSH_HOME = home
   t.after(() => { if (before === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = before })
   const calls: { kind: string; id: string; value?: any }[] = []
+  const composed: any[] = []
   const live = new Map<string, HostAgentHandle>()
   const stored = new Set<string>()
   let next = 0
@@ -32,12 +33,12 @@ function setup(t: any) {
   }
   const adapter = new HamsSessionAdapter({ db: h.db, service: h.service, dataDir: path.join(home, 'hams'), now: () => h.clock.now,
     agents: { create: o => make(o.sessionId, 'create', o), resume: o => make(o.resumeSessionId, 'resume', o) },
-    createUserMessage: value => value, compose: async config => ({ agentOptions: { model: config.model }, setup: config.agentPreset }), sessionId: () => `session-test-${++next}` })
+    createUserMessage: value => value, compose: async config => { composed.push(config); return { agentOptions: { model: config.model }, setup: config.agentPreset } }, sessionId: () => `session-test-${++next}` })
   t.after(async () => { await adapter.dispose(); h.close() })
   // Publish bot config for session tests
   h.service.publishMemberConfig(h.ctx(IDS.owner), { memberId: IDS.bot, changeClass: 'major', agentPreset: 'hams-bot', model: 'deepseek-chat', memoryScope: {} })
   const receipt = h.service.createWorkItem(h.ctx(IDS.owner), { domain: '安全', category: '巡检', title: '真实会话', projectId: IDS.project, templateVersionId: IDS.templateVersion, ownerHumanId: IDS.owner })
-  return { h, adapter, calls, live, stored, id: receipt.objectId! }
+  return { h, adapter, calls, composed, live, stored, id: receipt.objectId! }
 }
 
 test('real create before binding, one handle, five facts injected once per queued run', async t => {
@@ -97,6 +98,16 @@ test('major configuration starts next run on a new host session; minor retains p
   assert.equal(detail.thread!.member_version, 2)
   assert.equal(calls.filter(c => c.kind === 'create')[1].value.setup, 'hams-bot-v2')
   assert.equal(detail.threads[0].status, 'closed')
+})
+
+test('work-item sessions carry the member prompt into compose', async t => {
+  const { h, adapter, composed, id } = setup(t)
+  h.service.publishMemberConfig(h.ctx(IDS.owner), { memberId: IDS.bot, changeClass: 'major', model: 'deepseek-chat', prompt: '只做告警复查，先看证据。' })
+  await adapter.claim(h.ctx(IDS.bot, 'tool'), { workItemId: id })
+  const last = composed.at(-1)!
+  assert.equal(last.memberId, IDS.bot)
+  assert.equal(last.version, 2)
+  assert.equal(last.prompt, '只做告警复查，先看证据。')
 })
 
 test('tool context trusts only SDK agent session and preserves callId', () => {

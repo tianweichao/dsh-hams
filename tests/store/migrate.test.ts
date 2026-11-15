@@ -18,7 +18,7 @@ function memoryDb(): DatabaseSync {
   return db
 }
 
-test('t01 空库迁移到 v8：58 表（41 P1 + 4 知识 + 7 生命周期 + 3 项目群团队 + 1 目标检验 + 2 项目记忆）/ 36 条转换 / 唯一系统主体', () => {
+test('t01 空库迁移到 v9：58 表（41 P1 + 4 知识 + 7 生命周期 + 3 项目群团队 + 1 目标检验 + 2 项目记忆 + v9 加列）/ 36 条转换 / 唯一系统主体', () => {
   const db = memoryDb()
   const report = migrate(db)
 
@@ -34,6 +34,7 @@ test('t01 空库迁移到 v8：58 表（41 P1 + 4 知识 + 7 生命周期 + 3 �
     { version: 6, name: 'target-flow' },
     { version: 7, name: 'project-delete' },
     { version: 8, name: 'project-memory' },
+    { version: 9, name: 'bot-prompt' },
   ])
   assert.equal(report.checkedBaseline, true)
   assert.equal(userVersion(db), TARGET_VERSION)
@@ -47,6 +48,20 @@ test('t01 空库迁移到 v8：58 表（41 P1 + 4 知识 + 7 生命周期 + 3 �
     systemMember: true,
     transitions: 36,
   })
+  db.close()
+})
+
+test('t01b v9 迁移不去改 member_version 既有行（IMMUTABLE 触发器）', () => {
+  const db = memoryDb()
+  migrate(db, { migrations: MIGRATIONS.slice(0, 8) })
+  db.prepare("INSERT INTO member (id, kind, name, role, current_version, created_at, updated_at) VALUES ('h1','human','迁移负责人','coordinator',0,1,1)").run()
+  db.prepare("INSERT INTO member_version (id, member_id, version, agent_preset, model, memory_scope_json, prompt_digest, change_class, published_by, published_at) VALUES ('mv1','h1',1,'hams-bot','deepseek-chat','{}','d','major','h1',1)").run()
+
+  const report = migrate(db)
+  assert.deepEqual(report.applied.map((item) => item.version), [9])
+  const row = db.prepare("SELECT prompt FROM member_version WHERE id='mv1'").get() as { prompt: string }
+  assert.equal(row.prompt, '', '既有版本保持空白提示词，迁移不能 UPDATE 它')
+  assert.equal(userVersion(db), TARGET_VERSION)
   db.close()
 })
 

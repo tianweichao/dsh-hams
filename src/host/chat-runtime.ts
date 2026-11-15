@@ -3,8 +3,8 @@
  *
  * 三条边界（与设计一致）：
  * - **不改宿主 profile**：bot 用的 `hams-bot` preset 在插件运行时注册（C11 实测结论：
- *   preset 是 agent 作用域的组合，不碰公司 YAML 与 permissionPresets）；空组合 = 没有
- *   shell / 文件写这类 agent 作用域插件，bot 只剩全局注册的 HAMS 工具。
+ *   preset 是 agent 作用域的组合，不碰公司 YAML 与 permissionPresets）。2026-11-15 起
+ *   工具组合与官方 `standard` preset 对齐，人设由成员版本的提示词生成，见 `bot-preset.ts`。
  * - **不抄聊天正文**：消息用 `sessionQuery.readSession()` 从会话日志读（活会话也走它），
  *   HAMS 库只存会话指针。
  * - **不 import 宿主包**：插件不在宿主的 node_modules 里，所有宿主能力都从 `ctx.get()`
@@ -37,6 +37,7 @@ interface AgentsService {
 }
 interface SessionQueryService {
   readSession(sessionId: string): Promise<{ events?: readonly unknown[] }>
+  listSessions?(): Promise<Array<{ header?: { id?: string; parentSession?: string; origin?: string; createdAt?: number; cwd?: string } }>>
 }
 interface PresetsService {
   list(): Promise<ChatPresetRow[]>
@@ -53,45 +54,8 @@ interface DefaultModelService {
   currentSelection(): { provider: string; model: string; reasoningEffort?: string } | undefined
 }
 
-export const HAMS_BOT_PRESET = 'hams-bot'
-
-/**
- * bot 组合：persona（告诉它是 HAMS 的执行体）+ 压缩（长会话必备）。
- * 刻意不装 bash / tool-fs / subagent / 联网：C11 要求 bot 会话里没有 shell 与文件写，
- * 而且「装了再关 write」在 compositionInventory 里无法自证，干脆不装。
- */
-const HAMS_BOT_PRESET_DEFINITION = {
-  id: HAMS_BOT_PRESET,
-  name: 'HAMS bot',
-  description: 'HAMS 工作项执行体：没有 shell、文件写、委派与联网，只用宿主全局工具（含 HAMS 窄语义工具）',
-  order: 90,
-  plugins: [
-    {
-      id: 'persona',
-      name: '@deepseek-ai/dsh-persona',
-      config: {
-        prefix:
-          'You are a HAMS work-item agent. Facts about the work item come from the HAMS tools; never invent state or close a work item yourself. ' +
-          'Answer the human in Chinese, briefly. When the human is chatting in a project group, you are the coordinator: you may break work into tasks and assign them to other bots via the HAMS tools.',
-      },
-    },
-    {
-      id: 'compaction',
-      name: 'cordis:group',
-      group: true,
-      isolate: { compaction: true, toolResultPruner: true },
-      config: [
-        { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic' },
-        { id: 'command-compact', name: '@deepseek-ai/dsh-command-compact' },
-        {
-          id: 'tool-result-pruner',
-          name: '@deepseek-ai/dsh-compaction-tool-result-pruner',
-          config: { thresholdChars: 8192, headChars: 4096, tailChars: 1024 },
-        },
-      ],
-    },
-  ],
-} as const
+export { HAMS_BOT_PRESET, ensureHamsBotPreset, resolveBotPreset } from './bot-preset.ts'
+import { HAMS_BOT_PRESET, resolveBotPreset } from './bot-preset.ts'
 
 export interface HostChatRuntimeOptions {
   ctx: { get?: (name: string) => unknown }
@@ -217,48 +181,6 @@ export async function parseModelChoice(
   return { provider: fallbackProvider, model: raw }
 }
 
-/** 注册 bot preset（进程内只做一次）；装不起来返回 null，让调用方退回宿主默认 preset。 */
-let presetPromise: Promise<string | null> | null = null
-export function ensureHamsBotPreset(ctx: { get?: (name: string) => unknown }, log?: (line: string) => void): Promise<string | null> {
-  if (presetPromise) return presetPromise
-  const note = log || (() => {})
-  presetPromise = (async () => {
-    const registry = (() => {
-      try {
-        const found = ctx.get ? ctx.get('agentPresets') : undefined
-        return found && typeof found === 'object' ? (found as PresetsService) : undefined
-      } catch {
-        return undefined
-      }
-    })()
-    if (!registry) return null
-    try {
-      const list = await registry.list()
-      if (Array.isArray(list) && list.some((row) => row && row.id === HAMS_BOT_PRESET)) {
-        const resolved = await registry.resolve(HAMS_BOT_PRESET)
-        if (resolved && resolved.broken) {
-          note(`[hams] agent preset ${HAMS_BOT_PRESET} 不可用：${resolved.broken}`)
-          return null
-        }
-        return HAMS_BOT_PRESET
-      }
-      // register 不因装不起来而 reject：失败只会落成 record.broken，所以必须再 resolve 一次。
-      await registry.register(HAMS_BOT_PRESET_DEFINITION as never)
-      const resolved = await registry.resolve(HAMS_BOT_PRESET)
-      if (resolved && resolved.broken) {
-        note(`[hams] agent preset ${HAMS_BOT_PRESET} 不可用：${resolved.broken}`)
-        return null
-      }
-      note(`[hams] 已注册 agent preset ${HAMS_BOT_PRESET}`)
-      return HAMS_BOT_PRESET
-    } catch (error) {
-      note(`[hams] 注册 ${HAMS_BOT_PRESET} 失败，退回宿主默认 preset：${String(error)}`)
-      return null
-    }
-  })()
-  return presetPromise
-}
-
 /** 目录名只保留安全字符：会话 key 里带冒号与成员 id，不能直接当路径。 */
 function safeSegment(value: string): string {
   return String(value || 'default').replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'default'
@@ -269,7 +191,7 @@ export function createHostChatRuntime(options: HostChatRuntimeOptions): ChatRunt
   const log = options.log || (() => {})
   const handles = new Map<string, Promise<AgentHandleLike>>()
   const openings = new Map<string, Promise<AgentHandleLike>>()
-  const meta = new Map<string, { memberId: string; preset: string; model: string | null }>()
+  const meta = new Map<string, { memberId: string; memberName: string; memberVersion: number; prompt: string; preset: string; model: string | null }>()
   const contextSent = new Set<string>()
   let modelsCache: { at: number; rows: ChatModelRow[] } | null = null
   let closed = false
@@ -305,14 +227,32 @@ export function createHostChatRuntime(options: HostChatRuntimeOptions): ChatRunt
     }
   }
 
-  async function openSession(input: { sessionId?: string; memberId: string; preset: string; model: string | null; context?: string; cwdKey?: string }): Promise<AgentHandleLike> {
+  async function openSession(input: {
+    sessionId?: string
+    memberId: string
+    memberName: string
+    memberVersion: number
+    prompt: string
+    preset: string
+    model: string | null
+    context?: string
+    cwdKey?: string
+  }): Promise<AgentHandleLike> {
     const registry = agents()
     if (!registry) throw new Error('宿主没有 agents 服务')
     // bot 没配模型时用宿主默认模型兜底：否则新会话一开就报 has no provider/model。
     const parsedModel = await resolveAgentOptions(input.model, llm(), defaultModelService()?.currentSelection?.())
     if (!parsedModel) throw new Error('这个 bot 没有配置模型，宿主也没有默认模型；请给 bot 选一个模型或设置宿主默认模型')
     const agentOptions = Object.fromEntries(Object.entries(parsedModel).filter(([, value]) => value !== undefined && value !== ''))
-    const presetId = input.preset === HAMS_BOT_PRESET ? await ensureHamsBotPreset(ctx, log) : input.preset
+    // 成员没配别的宿主 preset 时，用「这个成员版本 + 提示词」生成的 hams-bot 人设；
+    // 配了 standard 之类就尊重选择，提示词由 ChatService 写进会话上下文。
+    const presetId = await resolveBotPreset(ctx, {
+      memberId: input.memberId,
+      memberName: input.memberName,
+      version: input.memberVersion,
+      prompt: input.prompt,
+      preset: input.preset,
+    }, log)
     // 一个 bot 被多个项目引用时，每个对话各占一个子目录，免得以后给了文件工具互相串。
     const cwd = path.resolve(dataDir, 'bots', input.memberId, 'chats', safeSegment(input.cwdKey || 'default'))
     const base = path.resolve(dataDir, 'bots') + path.sep
@@ -336,12 +276,12 @@ export function createHostChatRuntime(options: HostChatRuntimeOptions): ChatRunt
     return handle
   }
 
-  function handleFor(sessionId: string, input: { memberId: string; preset: string; model: string | null; context?: string }): Promise<AgentHandleLike> {
+  function handleFor(sessionId: string, input: { memberId: string; memberName: string; memberVersion: number; prompt: string; preset: string; model: string | null; context?: string }): Promise<AgentHandleLike> {
     const existing = handles.get(sessionId)
     if (existing) return existing
     const pending = openings.get(sessionId)
     if (pending) return pending
-    const opening = openSession({ sessionId, memberId: input.memberId, preset: input.preset, model: input.model, context: input.context })
+    const opening = openSession({ sessionId, ...input })
     openings.set(sessionId, opening)
     return opening
       .then((handle) => { handles.set(sessionId, Promise.resolve(handle)); return handle })
@@ -357,21 +297,22 @@ export function createHostChatRuntime(options: HostChatRuntimeOptions): ChatRunt
     },
     async ensure(input) {
       if (closed) throw new Error('对话运行时已停止')
+      const info = {
+        memberId: input.memberId,
+        memberName: input.memberName,
+        memberVersion: input.memberVersion,
+        prompt: input.prompt || '',
+        preset: input.agentPreset || HAMS_BOT_PRESET,
+        model: input.model,
+      }
       if (input.sessionId) {
-        meta.set(input.sessionId, { memberId: input.memberId, preset: input.agentPreset || HAMS_BOT_PRESET, model: input.model })
-        await handleFor(input.sessionId, { ...meta.get(input.sessionId)!, context: input.context })
+        meta.set(input.sessionId, info)
+        await handleFor(input.sessionId, { ...info, context: input.context })
         return { sessionId: input.sessionId }
       }
-      const presetId = input.agentPreset || HAMS_BOT_PRESET
-      const handle = await openSession({
-        memberId: input.memberId,
-        preset: presetId,
-        model: input.model,
-        cwdKey: input.key,
-        context: input.context,
-      })
+      const handle = await openSession({ ...info, cwdKey: input.key, context: input.context })
       const sessionId = handle.agent.session.id
-      meta.set(sessionId, { memberId: input.memberId, preset: presetId, model: input.model })
+      meta.set(sessionId, info)
       handles.set(sessionId, Promise.resolve(handle))
       return { sessionId }
     },
@@ -385,6 +326,10 @@ export function createHostChatRuntime(options: HostChatRuntimeOptions): ChatRunt
         content: [{ type: 'text', text }],
         source: { kind: 'user' },
       })
+    },
+    liveStatus(sessionId: string) {
+      const live = agents()?.get?.(sessionId)
+      return { live: Boolean(live), running: Boolean(live && live.status === 'running') }
     },
     async status(sessionId) {
       const live = agents()?.get?.(sessionId)
@@ -435,7 +380,8 @@ export function createHostChatRuntime(options: HostChatRuntimeOptions): ChatRunt
       if (!registry) return []
       try {
         const list = await registry.list()
-        return Array.isArray(list) ? list.filter((row) => row && row.id) : []
+        // 按成员版本生成的 hams-bot-<成员>-v<n>-<hash> 是内部实现，不出现在可选 preset 里。
+        return Array.isArray(list) ? list.filter((row) => row && row.id && !row.id.startsWith(`${HAMS_BOT_PRESET}-`)) : []
       } catch (error) {
         log(`[hams] 读 preset 目录失败：${String(error)}`)
         return []
@@ -470,6 +416,37 @@ export function createHostChatRuntime(options: HostChatRuntimeOptions): ChatRunt
       if (fallback && fallback.provider && fallback.model) push(fallback.provider, fallback.model, `${fallback.model}（宿主默认）`)
       modelsCache = { at: now, rows }
       return rows
+    },
+    async listSessions() {
+      const query = sessionQuery()
+      if (!query || typeof query.listSessions !== 'function') return []
+      try {
+        const rows = await query.listSessions()
+        return (Array.isArray(rows) ? rows : [])
+          .map((row) => row?.header)
+          .filter((header): header is NonNullable<typeof header> => Boolean(header && header.id))
+          .map((header) => ({
+            id: String(header!.id),
+            ...(header!.parentSession ? { parentSession: String(header!.parentSession) } : {}),
+            ...(header!.origin === 'subagent' ? { origin: 'subagent' as const } : {}),
+            createdAt: Number(header!.createdAt) || 0,
+            ...(header!.cwd ? { cwd: String(header!.cwd) } : {}),
+          }))
+      } catch (error) {
+        log(`[hams] 列会话失败：${String(error)}`)
+        return []
+      }
+    },
+    async readSessionEvents(sessionId: string) {
+      const query = sessionQuery()
+      if (!query) return []
+      try {
+        const snapshot = await query.readSession(sessionId)
+        return snapshot && Array.isArray(snapshot.events) ? snapshot.events : []
+      } catch (error) {
+        log(`[hams] 读会话 ${sessionId} 失败：${String(error)}`)
+        return []
+      }
     },
     async dispose() {
       closed = true

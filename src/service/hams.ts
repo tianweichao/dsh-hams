@@ -616,17 +616,49 @@ export class HamsService {
   createWorkItem(ctx: CommandContext, input: CreateWorkItemCommandInput): CommandReceipt {
     return this.command(ctx, 'workItem/create', input, () => {
       const principal = this.principal(ctx)
-      requireCapability(principal, CAPABILITY.workItemCreate)
-      if (principal.kind === 'bot') throw denied('bot 建单必须走提议，不能直接建单')
-      const ownerHumanId = input.ownerHumanId ?? principal.memberId
-      if (input.dedupeKey) {
-        const open = this.findOpenByDedupeKey(input.dedupeKey)
+      let ownerHumanId = input.ownerHumanId ?? principal.memberId
+      let dedupeKey = input.dedupeKey ?? null
+      let templateVersionId = input.templateVersionId ?? null
+      if (principal.kind === 'bot') {
+        // 推进 bot 可以直接给本项目建单（它就是项目里拆活的人）；其他 bot 仍需 work_item.create 能力。
+        // 仍然不允许 bot 把负责人写成人以外的角色：insertWorkItem 会拒绝。
+        if (!input.projectId) {
+          throw denied('bot 建单必须指定项目', '用 hams_create_work_item 并带上 projectId；跨项目建单属于越权')
+        }
+        const project = this.db
+          .prepare('SELECT id, owner_human_id, coordinator_id, deleted_at FROM project WHERE id = ?')
+          .get(input.projectId) as
+          | { id: string; owner_human_id: string; coordinator_id: string | null; deleted_at: number | null }
+          | undefined
+        if (!project || project.deleted_at) throw stateInvalid(`项目不存在：${input.projectId}`)
+        if (project.coordinator_id !== principal.memberId) {
+          requireCapability(principal, CAPABILITY.workItemCreate)
+          const joined = this.db
+            .prepare('SELECT 1 AS ok FROM project_participant WHERE project_id = ? AND member_id = ? AND removed_at IS NULL')
+            .get(project.id, principal.memberId) as { ok: number } | undefined
+          if (!joined) throw denied('只能给自己所在的项目建单', '先让项目管理员把你拉进项目团队')
+        }
+        ownerHumanId = input.ownerHumanId ?? project.owner_human_id
+        // 沿用这个项目最近一条有模板的工作项，避免 bot 建出来的单没有判据/复查策略。
+        if (!templateVersionId) {
+          const prior = this.db
+            .prepare('SELECT template_version_id FROM work_item WHERE project_id = ? AND template_version_id IS NOT NULL ORDER BY created_at DESC LIMIT 1')
+            .get(project.id) as { template_version_id: string } | undefined
+          templateVersionId = prior?.template_version_id ?? null
+        }
+        // 同一轮/多轮重复建单的去重：bot 不传 dedupeKey 时按「项目 + 标题」自动生成。
+        dedupeKey = dedupeKey ?? `agent:${project.id}:${createHash('sha256').update(String(input.title).trim()).digest('hex').slice(0, 16)}`
+      } else {
+        requireCapability(principal, CAPABILITY.workItemCreate)
+      }
+      if (dedupeKey) {
+        const open = this.findOpenByDedupeKey(dedupeKey)
         if (open) {
           const auditId = this.audit(ctx, principal, {
             action: 'workItem/create',
             subjectKind: 'work_item',
             subjectId: open.id,
-            after: { duplicate: true, dedupeKey: input.dedupeKey },
+            after: { duplicate: true, dedupeKey },
           })
           return this.receipt(ctx, {
             status: 'accepted',
@@ -634,7 +666,7 @@ export class HamsService {
             objectRevision: open.revision,
             executionEpoch: open.execution_epoch,
             auditId,
-            detail: { duplicate: true, dedupeKey: input.dedupeKey },
+            detail: { duplicate: true, dedupeKey },
           })
         }
       }
@@ -644,9 +676,9 @@ export class HamsService {
         title: input.title,
         ownerHumanId,
         projectId: input.projectId ?? null,
-        templateVersionId: input.templateVersionId ?? null,
+        templateVersionId,
         assetId: input.assetId ?? null,
-        dedupeKey: input.dedupeKey ?? null,
+        dedupeKey,
         priority: input.priority,
         dueAt: input.dueAt ?? null,
         createdBy: principal.memberId,
@@ -2344,6 +2376,7 @@ export class HamsService {
       if (detail.status === 'paused') actions.push('resume', 'retire')
       if (detail.status === 'retired') actions.push('resume')
     }
+    // 子代理也允许发布职责/提示词：作为 HAMS 侧记录，已创建的宿主会话不会因此改变。
     if (canManage && detail.kind === 'bot' && detail.status !== 'retired') actions.push('publishConfig')
     const bot_versions = this.db.prepare('SELECT * FROM member_version WHERE member_id=? ORDER BY version DESC').all(memberId).map((v:any) => ({...v,memory_scope:JSON.parse(v.memory_scope_json),skills:this.db.prepare('SELECT * FROM member_version_skill WHERE member_version_id=?').all(v.id),responsibility:(this.db.prepare("SELECT after_json FROM audit_log WHERE subject_kind='member' AND subject_id=? AND action IN ('member/publishConfig','member/create') ORDER BY created_at DESC,rowid DESC").all(memberId) as any[]).map(a=>JSON.parse(a.after_json)).find(a=>a.versionId===v.id || a.version===v.version)?.responsibility ?? null}))
     return { ...detail, bot_versions, memories: queryMemberMemories(this.db, memberId), activity: memberActivity(this.db,this.now(),memberId,this.timeZone), allowedActions: actions }
@@ -2372,7 +2405,7 @@ export class HamsService {
         action: 'member/create',
         subjectKind: 'member',
         subjectId: created.id,
-        after: { kind: created.kind, version: created.version, capabilities: created.capabilities, responsibility: input.responsibility ?? '', model: input.model ?? null, agentPreset: input.agentPreset ?? null, memoryScope: {} },
+        after: { kind: created.kind, version: created.version, capabilities: created.capabilities, responsibility: input.responsibility ?? '', model: input.model ?? null, agentPreset: input.agentPreset ?? null, prompt: input.prompt ?? '', memoryScope: {} },
       })
       return this.receipt(ctx, {
         status: 'applied',

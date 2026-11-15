@@ -80,6 +80,8 @@ export interface HamsToolsOptions {
   idempotencyFor?: (exec: ToolExecContext, tool: string) => string | undefined
   /** 项目群：成员名单、@ 发言、建临时 bot。没注入时这些工具明确报不可用。 */
   chat?: GroupChatPort
+  /** 指派成功后立刻触发一次派发（不阻塞工具返回）。 */
+  onAssigned?: (workItemId: string) => void
 }
 
 export function resolveThreadIdentity(db: DatabaseSync, sessionId: string): ThreadIdentity | null {
@@ -307,6 +309,8 @@ export function createHamsTools(options: HamsToolsOptions): ToolDefinition[] {
           const workItemId = asString(args.id, 'id')
           const assigneeId = asString(args.assigneeId, 'assigneeId')
           const result = service.assignWorkItem(context(identity, exec, 'assign'), { workItemId, memberId: assigneeId })
+          // 指派成功就立刻踢一次派发，不等 5 秒定时器；失败不影响指派本身。
+          try { options.onAssigned?.(workItemId) } catch { /* 派发器会重试 */ }
           // 指派同时，在群聊里打出 @接活人：人类要看得见「派给了谁」。
           try {
             groupPort().noteAssignment?.(exec.sessionId, {
@@ -317,6 +321,47 @@ export function createHamsTools(options: HamsToolsOptions): ToolDefinition[] {
             // 不在项目群会话里（或宿主没接群聊）：指派本身已经成功，不因此失败。
           }
           return result
+        })
+      },
+    },
+    {
+      name: 'hams_create_work_item',
+      description:
+        '在项目里登记一条工作任务（工作项）。项目推进 bot 可以直接给本项目建单；其他 bot 需要 work_item.create 能力。'
+        + '同一项目 + 同一标题会自动去重，重复调用返回已有工作项。建单不会自动派活：需要再用 hams_assign_task 指派，并在群聊里 @ 对方。'
+        + '当人类提出一件新活、或项目目标需要拆成可执行任务时先用这个工具建单，不要只在群里口头答应。',
+      parameters: {
+        type: 'object',
+        properties: {
+          projectId: { type: 'string', description: '工作项所属项目 id（必填）' },
+          title: { type: 'string', description: '任务标题：写清要交付什么、范围与验收口径' },
+          domain: { type: 'string', description: '业务域；省略为「通用」' },
+          category: { type: 'string', description: '任务类别；省略为「执行」' },
+          ownerHumanId: { type: 'string', description: '负责人（必须是人的成员 id）；省略为项目负责人' },
+          templateVersionId: { type: 'string', description: '判据模板版本 id；省略则建单后再补' },
+          dedupeKey: { type: 'string', description: '幂等键；省略时按项目 + 标题自动生成' },
+          priority: { type: 'number', description: '优先级，数字越小越靠前' },
+          dueAt: { type: 'number', description: '截止时间（UTC 毫秒）' },
+        },
+        required: ['projectId', 'title'],
+        additionalProperties: false,
+      },
+      execute(rawArgs, exec) {
+        return run(() => {
+          const identity = memberIdentity(exec)
+          const args = asObject(rawArgs, 'args')
+          assertNoIdentityArgs(args)
+          return service.createWorkItem(context(identity, exec, 'create-work-item'), {
+            projectId: asString(args.projectId, 'projectId'),
+            title: asString(args.title, 'title'),
+            domain: optionalString(args.domain, 'domain') || '通用',
+            category: optionalString(args.category, 'category') || '执行',
+            ownerHumanId: optionalString(args.ownerHumanId, 'ownerHumanId'),
+            templateVersionId: optionalString(args.templateVersionId, 'templateVersionId'),
+            dedupeKey: optionalString(args.dedupeKey, 'dedupeKey'),
+            priority: args.priority === undefined ? undefined : asNumber(args.priority, 'priority'),
+            dueAt: args.dueAt === undefined ? undefined : asNumber(args.dueAt, 'dueAt'),
+          })
         })
       },
     },
@@ -688,6 +733,7 @@ export const TOOL_NAMES = [
   'hams_get_work_item',
   'hams_claim',
   'hams_assign_task',
+  'hams_create_work_item',
   'hams_list_project_work',
   'hams_group_members',
   'hams_group_send',

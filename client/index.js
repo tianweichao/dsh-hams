@@ -668,6 +668,7 @@ window.__ModuleLoader__.load({
     const KNOWLEDGE_KIND_LABEL = { doc: '文档', skill: '技能', table: '数据表' };
     const KNOWLEDGE_STATUS_LABEL = { draft: '草稿', published: '已发布', archived: '已归档', retired: '已退役' };
     const BOT_CAPABILITIES = [
+      ['work_item.create', '建工作项'],
       ['work_item.claim', '认领工作项'],
       ['work_item.execute', '执行'],
       ['work_item.request_closure', '申请关单'],
@@ -911,7 +912,10 @@ function PMWorkList({ items = [], onOpen }) {
     h('div', { key: 'hdr', style: { display: 'grid', gridTemplateColumns: cols, gap: 10, padding: '0 11px', color: C.muted, fontSize: 11 } }, [
       h('span', { key: 's' }, '状态'), h('span', { key: 't' }, '任务名称'), h('span', { key: 'u' }, '更新时间'), h('span', { key: 'n' }, '下一步工作'), h('span', { key: 'd' }, '截止时间'),
     ]),
-    ...items.map((item) => h('div', {
+    ...items.map((item) => {
+      // 已指派但超过 90 秒还没被派发器认领：把「卡住」显式画出来，而不是一直显示“待处理”。
+      const waitingDispatch = item.status === 'ready' && item.assignee_id && Date.now() - Number(item.updated_at || 0) > 90_000;
+      return h('div', {
       key: item.id,
       style: { display: 'grid', gridTemplateColumns: cols, gap: 10, alignItems: 'center', padding: '8px 10px', border: 'none', borderRadius: 10, background: C.tint, fontSize: 12.5, minWidth: 0 },
     }, [
@@ -921,9 +925,12 @@ function PMWorkList({ items = [], onOpen }) {
         style: { textAlign: 'left', padding: 0, border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 500, font: 'inherit' },
       }, item.title) : h('strong', { key: 't', style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, item.title),
       cell('u', fmtDay(item.updated_at)),
-      cell('n', item.next_action_at ? fmtDay(item.next_action_at) : '—'),
+      waitingDispatch
+        ? cell('n', '等待派发', { title: '已指派，但派发器还没认领；若长时间不动，重启 DSH 或查看派发器日志', style: { color: C.warn } })
+        : cell('n', item.next_action_at ? fmtDay(item.next_action_at) : '—'),
       cell('d', item.due_at ? fmtDay(item.due_at) : '—'),
-    ])),
+    ]);
+    }),
   ]);
 }
 /** 宿主能力目录：agent preset 与模型。拿不到就退回手填，不阻塞配置。 */
@@ -1302,7 +1309,7 @@ function GroupChatPane({ projectId, title, bots = [] }) {
 }
 
 /** 团队页签：推进 bot + 手动加入的常驻 bot + 项目内临时 bot。三列对齐：成员 / 职责 / 操作。 */
-function PMTeamTab({ project, bots = [] }) {
+function PMTeamTab({ project, bots = [], onOpenMember }) {
   const [team, setTeam] = React.useState(null);
   const [error, setError] = React.useState(null);
   const [busy, setBusy] = React.useState(false);
@@ -1315,7 +1322,8 @@ function PMTeamTab({ project, bots = [] }) {
     try { setTeam(await call('chat/team', { payload: { projectId: project.id } })); setError(null); }
     catch (err) { setError(err); }
   }, [project.id]);
-  React.useEffect(() => { load(); }, [load]);
+  // 团队页要跟得上 bot 新起的子代理：5 秒轮询一次（查询很轻，只读成员/会话状态）。
+  React.useEffect(() => { load(); const timer = setInterval(load, 5000); return () => clearInterval(timer); }, [load]);
 
   const run = async (fn) => {
     setBusy(true); setError(null);
@@ -1326,29 +1334,52 @@ function PMTeamTab({ project, bots = [] }) {
   const members = (team && team.members) || [];
   const joined = new Set([...(coordinator ? [coordinator.memberId] : []), ...members.map((row) => row.memberId)]);
   const candidates = (bots || []).filter((bot) => bot.kind === 'bot' && bot.status === 'active' && !joined.has(bot.id));
-  const columns = 'minmax(210px, 1.1fr) minmax(0, 2fr) 88px';
+  const columns = 'minmax(190px, 1.1fr) minmax(0, 1.8fr) 76px 132px';
 
   const memberCell = (member) => h('div', { key: 'm', style: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, whiteSpace: 'nowrap' } }, [
-    badge(member.kind === 'coordinator' ? '推进' : member.kind === 'temp' ? '临时' : '成员', member.kind === 'coordinator' ? C.accent : member.kind === 'temp' ? C.warn : C.muted),
+    badge(member.kind === 'coordinator' ? '推进' : member.kind === 'subagent' ? '子代理' : member.kind === 'temp' ? '临时' : '成员', member.kind === 'coordinator' ? C.accent : member.kind === 'subagent' ? C.ok : member.kind === 'temp' ? C.warn : C.muted),
     h('strong', { key: 'n', style: { fontSize: 12.5, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' } }, member.name),
     member.status !== 'active' ? h('span', { key: 's', style: { ...styles.muted, fontSize: 11 } }, member.status) : null,
     member.running ? h('span', { key: 'r', style: { ...styles.muted, color: C.warn, fontSize: 11 } }, '运行中') : null,
   ]);
 
+  const openMember = (member) => {
+    if (typeof onOpenMember === 'function') { onOpenMember(member.memberId, 'config'); return; }
+    // 兜底：宿主老版本没把回调传进来时，走深链接整页打开成员配置。
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.set('hamsView', 'agents');
+      url.searchParams.set('hamsMember', member.memberId);
+      window.location.assign(url.toString());
+    } catch (err) { console.error('[hams] 打开成员失败：', err); }
+  };
   const row = (member) => h('div', {
     key: member.memberId,
-    style: { display: 'grid', gridTemplateColumns: columns, alignItems: 'center', gap: 12, padding: '10px 2px', border: 'none', borderRadius: 10, background: 'transparent', minWidth: 0 },
+    role: onOpenMember ? 'button' : undefined,
+    tabIndex: onOpenMember ? 0 : undefined,
+    title: onOpenMember ? '打开成员详情：看配置、改提示词（临时 bot 也能改）' : member.brief || '',
+    onClick: onOpenMember ? () => openMember(member) : undefined,
+    onKeyDown: onOpenMember ? (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openMember(member); } } : undefined,
+    style: { display: 'grid', gridTemplateColumns: columns, alignItems: 'center', gap: 12, padding: '10px 2px', border: 'none', borderRadius: 10, background: 'transparent', minWidth: 0, cursor: onOpenMember ? 'pointer' : 'default' },
   }, [
     memberCell(member),
     h('span', { key: 'd', title: member.brief || '', style: { ...styles.muted, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, member.brief || '—'),
-    h('div', { key: 'a', style: { display: 'flex', justifyContent: 'flex-end' } },
-      member.kind === 'coordinator' ? null : h(PMButton, { key: 'x', disabled: busy, onClick: () => run(() => call('chat/team/remove', { payload: { projectId: project.id, memberId: member.memberId } })) }, '移出')),
+    h('div', { key: 'st', style: { display: 'flex', justifyContent: 'flex-start' } },
+      member.status !== 'active'
+        ? badge({ paused: '暂停', retired: '已退休' }[member.status] || member.status, C.muted)
+        : member.running
+          ? badge('运行中', C.ok)
+          : badge('空闲', C.muted)),
+    h('div', { key: 'a', style: { display: 'flex', justifyContent: 'flex-end', gap: 6 } }, [
+      h(PMButton, { key: 'view', disabled: busy, onClick: (event) => { if (event && event.stopPropagation) event.stopPropagation(); openMember(member); } }, '查看'),
+      member.kind === 'coordinator' || member.kind === 'subagent' ? null : h(PMButton, { key: 'x', disabled: busy, onClick: (event) => { if (event && event.stopPropagation) event.stopPropagation(); run(() => call('chat/team/remove', { payload: { projectId: project.id, memberId: member.memberId } })); } }, '移出'),
+    ]),
   ]);
 
   return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, minWidth: 0 } }, [
     h('div', { key: 'h', style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' } }, [
       h('strong', { key: 't', style: { fontSize: 13 } }, '团队'),
-      h('span', { key: 'd', style: { ...styles.muted, minWidth: 0 } }, '推进 bot 指挥；成员被 @ 时在自己的会话里回答；临时 bot 只属于这个项目。'),
+      h('span', { key: 'd', style: { ...styles.muted, minWidth: 0 } }, '推进 bot 指挥；成员被 @ 时在自己的会话里回答；临时 bot 只属于这个项目；子代理由 bot 的 subagent 调用自动登记。'),
       h('div', { key: 'sp', style: { flex: '1 1 auto' } }),
       h(PMButton, { key: 'add', primary: true, disabled: busy, onClick: () => setAddOpen((open) => !open) }, addOpen ? '收起' : '+ 成员'),
     ]),
@@ -1367,10 +1398,10 @@ function PMTeamTab({ project, bots = [] }) {
         h('div', { key: 'b', style: { maxWidth: 360 } }, h(PMInput, { label: '职责（一句话）', value: brief, onChange: setBrief, placeholder: '只查这一周的因子' })),
         h(PMButton, { key: 'go', disabled: busy || !name.trim(), onClick: async () => { if (await run(() => call('chat/team/spawn', { payload: { projectId: project.id, name: name.trim(), brief: brief.trim() } }))) { setName(''); setBrief(''); setAddOpen(false); } } }, '创建临时 bot'),
       ]),
-      h('span', { key: 'hint', style: styles.muted }, '临时 bot 由你创建、只属于本项目；推进 bot 自己也可以建（hams_group_spawn_bot），建完会出现在下面。'),
+      h('span', { key: 'hint', style: styles.muted }, '临时 bot 由你创建、只属于本项目；推进 bot 自己也可以建（hams_group_spawn_bot）。bot 用 subagent 起的子代理会自动登记为「子代理」，跑完也留在这里可追溯。'),
     ]) : null,
     h('div', { key: 'cols', style: { display: 'grid', gridTemplateColumns: columns, gap: 12, padding: '0 12px', ...styles.muted, fontSize: 11 } }, [
-      h('span', { key: 'c1' }, '成员'), h('span', { key: 'c2' }, '职责'), h('span', { key: 'c3', style: { textAlign: 'right' } }, '操作'),
+      h('span', { key: 'c1' }, '成员'), h('span', { key: 'c2' }, '职责'), h('span', { key: 'c3' }, '状态'), h('span', { key: 'c4', style: { textAlign: 'right' } }, '操作'),
     ]),
     h('div', { key: 'rows', style: { display: 'flex', flexDirection: 'column', gap: 6 } }, [
       coordinator ? row(coordinator) : h('div', { key: 'noc', style: styles.notice }, '这个项目还没有推进 bot，群聊没有指挥者。'),
@@ -1836,7 +1867,7 @@ function PMMemoryTab({ project, bots = [], canManage, onRefresh }) {
         : h(PMEmpty, { key: 'e' }, status === 'archived' ? '还没有归档的记忆。' : '还没有记忆。群聊里出现决定、偏好、教训或能力经验时会自动收到这里；也可以点「记一条」手动补。'),
   ]);
 }
-function PMProjectDetail({ detail, humans = [], bots = [], me, busy, onCommand, onStatus, onRecord, onGotoTasks, onOpenWorkItem, onClose, initialTab, onPublishTarget, onContinueDraft, onDelete, onRefreshDetail }) {
+function PMProjectDetail({ detail, humans = [], bots = [], me, busy, onCommand, onStatus, onRecord, onGotoTasks, onOpenWorkItem, onClose, initialTab, onPublishTarget, onContinueDraft, onDelete, onRefreshDetail, onOpenMember }) {
   const [tab, setTab] = React.useState(initialTab || 'chat'); const [form, setForm] = React.useState(''); const [progressFilter, setProgressFilter] = React.useState('all'); const [confirmDelete, setConfirmDelete] = React.useState(false);
   const state = usePMCommand(onCommand); const locked = busy || state.pending;
   const metrics = detail.metrics || []; const phases = detail.phases || []; const reviews = detail.reviews || []; const progress = detail.progress_records || {};
@@ -1870,7 +1901,7 @@ function PMProjectDetail({ detail, humans = [], bots = [], me, busy, onCommand, 
     h(ErrorBox, { key: 'err', error: state.error, onDismiss: state.dismiss }),
     h(PMTabs, { key: 'tabs', tabs: [['chat', '群聊'], ['team', '团队'], ...PM_PROJECT_TABS.map(([key, label]) => key === 'memory' && Number(detail.memory_count) > 0 ? [key, `${label} ${detail.memory_count}`] : [key, label])], value: tab, onChange: setTab, label: '项目页签' }),
     tab === 'chat' ? h(GroupChatPane, { key: 'chat', projectId: detail.id, title: detail.name, bots }) : null,
-    tab === 'team' ? h(PMTeamTab, { key: 'team', project: detail, bots }) : null,
+    tab === 'team' ? h(PMTeamTab, { key: 'team', project: detail, bots, onOpenMember }) : null,
     tab === 'deliverables' ? h(PMDeliverablesTab, { key: 'deliverables', project: detail }) : null,
     tab === 'goals' ? h(PMGoalsTab, { key: 'goals', detail, metrics, phases, humans, me, busy: locked, locked, can, state, onPublishTarget, onRecord, form, onForm: setForm }) : null,
     tab === 'work' ? h('div', { key: 'work', role: 'tabpanel', style: styles.list }, [h('div', { key: 'bar', style: styles.row }, [h('span', { key: 'n', style: styles.muted }, `${items.length} 条${fullWorkItems ? '关联' : '近期'}工作项`), h(PMButton, { key: 'new', primary: true, disabled: locked || !can('createWorkItem') || !onGotoTasks, onClick: () => onGotoTasks(detail.id) }, '新建工作项')]), ...Array.from(new Set(items.map((i) => i.domain || '未分域'))).map((domain) => h('section', { key: domain, style: styles.card }, [h('strong', { key: 'h' }, domain), h(PMWorkList, { key: 'list', items: items.filter((i) => (i.domain || '未分域') === domain), onOpen: onOpenWorkItem })])), !items.length ? h(PMEmpty, { key: 'e' }, '还没有关联工作项') : null, h('details', { key: 'progress', style: { paddingTop: 4 } }, [h('summary', { key: 's' }, '推进记录（提议 / 决定 / 项目变更）'), h('div', { key: 'p', style: { display: 'flex', flexDirection: 'column', gap: 8, paddingTop: 8 } }, [h(PMSelect, { key: 'filter', label: '推进记录筛选', value: progressFilter, onChange: setProgressFilter, options: [['all', '全部'], ['open', '待决定'], ['accepted', '已采纳'], ['rejected', '已驳回']] }), ...(progress.proposals || []).filter((p) => progressFilter === 'all' || p.status === progressFilter).map((p) => { const ds = (progress.decisions || []).filter((d) => d.proposal_id === p.id); return h('article', { key: p.id, style: styles.card }, [h('strong', { key: 't' }, p.title), h('span', { key: 'p' }, `提议：${p.body || '未附说明'}`), h('span', { key: 'd', style: styles.muted }, `决定：${ds.length ? ds.map((d) => `${d.decision || d.status} · ${d.reason_text || d.note_text || d.note || ''} · ${fmtTime(d.created_at)}`).join('；') : p.status === 'open' ? '等待决定' : p.status || '未知'}`), h('span', { key: 'r', style: styles.muted }, `结果：${p.result_text || p.result_work_item_id || p.work_item_id || '尚无结果记录'}`)]); }), ...(progress.events || []).map((e, i) => h('div', { key: e.id || i, style: styles.item }, [h('span', { key: 't' }, e.summary || e.action || e.event_type || '项目变更'), h('span', { key: 'd', style: styles.muted }, fmtTime(e.created_at))])), !(progress.proposals || []).length && !(progress.events || []).length ? h(PMEmpty, { key: 'e' }, '还没有推进记录。提议决定汇总在总览「待我把关」。') : null])])]) : null,
@@ -1882,7 +1913,7 @@ function PMProjectDetail({ detail, humans = [], bots = [], me, busy, onCommand, 
     ]) : null,
   ]);
 }
-function ProjectScreen({ projects = [], detail, busy, formOpen, draft = null, bots = [], humans = [], me, onCreate, onOpen, onFormOpen, onStatus, onRecord, onGotoTasks, onCommand, onSaveDraft, onPublish, onContinueDraft, onDelete, allowedActions = [], onOpenWorkItem, onClose, initialTab, onRefreshDetail }) {
+function ProjectScreen({ projects = [], detail, busy, formOpen, draft = null, bots = [], humans = [], me, onCreate, onOpen, onFormOpen, onStatus, onRecord, onGotoTasks, onCommand, onSaveDraft, onPublish, onContinueDraft, onDelete, allowedActions = [], onOpenWorkItem, onClose, initialTab, onRefreshDetail, onOpenMember }) {
   const [query, setQuery] = React.useState(''); const [type, setType] = React.useState(''); const [owner, setOwner] = React.useState(''); const [mine, setMine] = React.useState(false); const [view, setView] = React.useState('list');
   // 发布新目标口径是独立页：取消/发布后回到「目标与阶段」页签，不再嵌在页签里。
   const [targetOpen, setTargetOpen] = React.useState(false); const [returnTab, setReturnTab] = React.useState('chat');
@@ -1906,7 +1937,7 @@ function ProjectScreen({ projects = [], detail, busy, formOpen, draft = null, bo
   // 详情独立成页：整页只显示详情，顶部给返回入口
   if (detail) {
     return h(PMPage, { key: `project-${detail.id}`, backLabel: '← 返回项目列表', onBack: () => { setTargetOpen(false); if (onClose) onClose(); }, crumb: `项目 / ${detail.name}` },
-      h(PMProjectDetail, { key: detail.id, detail, busy, humans, bots, me, onCommand, onStatus, onRecord, onGotoTasks, onOpenWorkItem, initialTab: initialTab || returnTab, onPublishTarget: openTarget, onContinueDraft, onDelete, onRefreshDetail }));
+      h(PMProjectDetail, { key: detail.id, detail, busy, humans, bots, me, onCommand, onStatus, onRecord, onGotoTasks, onOpenWorkItem, onOpenMember, initialTab: initialTab || returnTab, onPublishTarget: openTarget, onContinueDraft, onDelete, onRefreshDetail }));
   }
 
   // 没有详情时显示列表
@@ -1940,13 +1971,14 @@ function MemberCreateForm({ positions = [], humans = [], busy, onSubmit, onCance
   const catalog = useHostCatalog();
   const [kind, setKind] = usePMDraft('pm/member-create/' + 'kind', 'human'); const [name, setName] = usePMDraft('pm/member-create/' + 'name', ''); const [role, setRole] = usePMDraft('pm/member-create/' + 'role', 'executor');
   const [domain, setDomain] = usePMDraft('pm/member-create/' + 'domain', ''); const [responsibility, setResponsibility] = usePMDraft('pm/member-create/' + 'responsibility', ''); const [positionId, setPositionId] = usePMDraft('pm/member-create/' + 'positionId', '');
-  const [ownerHumanId, setOwnerHumanId] = usePMDraft('pm/member-create/' + 'ownerHumanId', ''); const [preset, setPreset] = usePMDraft('pm/member-create/' + 'preset', ''); const [model, setModel] = usePMDraft('pm/member-create/' + 'model', ''); const [capabilities, setCapabilities] = usePMDraft('pm/member-create/' + 'capabilities', []);
+  const [ownerHumanId, setOwnerHumanId] = usePMDraft('pm/member-create/' + 'ownerHumanId', ''); const [preset, setPreset] = usePMDraft('pm/member-create/' + 'preset', ''); const [model, setModel] = usePMDraft('pm/member-create/' + 'model', ''); const [prompt, setPrompt] = usePMDraft('pm/member-create/' + 'prompt', ''); const [capabilities, setCapabilities] = usePMDraft('pm/member-create/' + 'capabilities', []);
   const toggle = (key) => setCapabilities((rows) => rows.includes(key) ? rows.filter((r) => r !== key) : [...rows, key]);
   const activePositions = positions.filter((p) => !p.status || p.status === 'active'); const activeHumans = humans.filter((p) => !p.status || p.status === 'active');
   const valid = name.trim() && responsibility.trim() && (kind === 'human' ? positionId : ownerHumanId && domain.trim());
   return h('section', { style: styles.card }, [h('strong', { key: 'h' }, '新建成员'), h('div', { key: 'kind', role: 'group', 'aria-label': '成员类型', style: { display: 'flex', gap: 6 } }, [['human', '人'], ['bot', 'bot']].map(([key, label]) => h(PMButton, { key, primary: kind === key, disabled: busy, onClick: () => setKind(key) }, label))),
     h('div', { key: 'basic', style: styles.grid }, [h(PMInput, { key: 'n', label: '姓名 / 名称', value: name, onChange: setName, disabled: busy }), h(PMSelect, { key: 'r', label: '角色', value: role, onChange: setRole, disabled: busy, options: [['coordinator', '协调'], ['executor', '执行'], ['observer', '观察']] }), h(PMInput, { key: 'd', label: kind === 'bot' ? '业务域（必填，限定授权范围）' : '业务域', value: domain, onChange: setDomain, disabled: busy })]),
     h(PMInput, { key: 'resp', label: '职责', value: responsibility, onChange: setResponsibility, multiline: true, disabled: busy }),
+    kind === 'bot' ? h(PMInput, { key: 'prompt', label: '提示词（可选；默认用职责）', value: prompt, onChange: setPrompt, multiline: true, disabled: busy }) : null,
     kind === 'human' ? h('div', { key: 'human', style: styles.list }, [h(PMSelect, { key: 'p', label: '在岗岗位', value: positionId, onChange: setPositionId, disabled: busy, options: [['', '请选择'], ...activePositions.map((p) => [p.id, p.name])] }), h('span', { key: 'hint', style: styles.muted }, '岗位从创建时开始在岗，暂不设截止时间。登录身份需另行绑定；本次创建不接入账号。人的能力来自在岗岗位。'), !activePositions.length ? h(PMEmpty, { key: 'e' }, '没有可选的在岗岗位，需先配置岗位。') : null]) : h('div', { key: 'bot', style: styles.list }, [
       h(PMSelect, { key: 'owner', label: '责任人（人）', value: ownerHumanId, onChange: setOwnerHumanId, disabled: busy, options: [['', '请选择'], ...activeHumans.map((p) => [p.id, p.name])] }),
       h('div', { key: 'config', style: styles.grid }, [
@@ -1954,7 +1986,7 @@ function MemberCreateForm({ positions = [], humans = [], busy, onSubmit, onCance
         h(PresetSelect, { key: 'p', catalog, value: preset, onChange: setPreset, disabled: busy }),
       ]),
       h('strong', { key: 'caphead' }, '工具能力白名单'), h('div', { key: 'caps', style: { display: 'flex', flexWrap: 'wrap', gap: 12 } }, BOT_CAPABILITIES.map(([key, label]) => h('label', { key, style: { display: 'inline-flex', gap: 5, alignItems: 'center' } }, [h('input', { key: 'i', type: 'checkbox', checked: capabilities.includes(key), disabled: busy, onChange: () => toggle(key) }), label]))),
-      h('span', { key: 'limits', style: styles.muted }, '审批决策：只有人能在界面批准。业务 bot 不提供通用 shell 或文件写入；授权限定在所填业务域，不跨域。'),
+      h('span', { key: 'limits', style: styles.muted }, '审批决策：只有人能在界面批准。bot 的宿主工具与官方 standard preset 对齐；HAMS 业务动作按能力白名单授予，授权限定在所填业务域。'),
     ]),
     h('div', { key: 'actions', style: styles.row }, [h(PMButton, { key: 's', primary: true, disabled: busy || !valid || !onSubmit, onClick: () => onSubmit({ kind, name: name.trim(), role, domain: domain.trim() || undefined, responsibility: responsibility.trim(), positionId: kind === 'human' ? positionId : undefined, ownerHumanId: kind === 'bot' ? ownerHumanId : undefined, agentPreset: kind === 'bot' ? preset.trim() || undefined : undefined, model: kind === 'bot' ? model.trim() || undefined : undefined, capabilities: kind === 'bot' ? capabilities : undefined, scope: kind === 'bot' ? `domain:${domain.trim()}` : undefined }) }, busy ? '提交中…' : kind === 'bot' ? '创建并发布 v1' : '创建成员'), h(PMButton, { key: 'cancel', disabled: busy, onClick: onCancel }, '取消')]),
   ]);
@@ -1965,6 +1997,8 @@ function PMMemberEditor({ detail, busy, onCommand }) {
   const prefix = `pm/member-config/${detail.id}/${detail.current_version}/`;
   const initialMemory = JSON.stringify(config.memory_scope || PMParse(config.memory_scope_json, {}) || {}, null, 2);
   const [responsibility, setResponsibility] = usePMDraft(prefix + 'responsibility', detail.responsibility || config.responsibility || '');
+  const initialPrompt = config.prompt || detail.prompt || '';
+  const [prompt, setPrompt] = usePMDraft(prefix + 'prompt', initialPrompt);
   const [model, setModel] = usePMDraft(prefix + 'model', config.model || detail.model || '');
   const [preset, setPreset] = usePMDraft(prefix + 'preset', config.agent_preset || detail.agent_preset || '');
   const [memory, setMemory] = usePMDraft(prefix + 'memory', initialMemory);
@@ -1974,9 +2008,10 @@ function PMMemberEditor({ detail, busy, onCommand }) {
   const [editing, setEditing] = React.useState(false);
   const locked = busy || state.pending || !canPublish || !editing;
   const parsedMemory = PMParse(memory, null); const validMemory = parsedMemory && typeof parsedMemory === 'object' && !Array.isArray(parsedMemory);
-  const needsMajor = model !== (config.model || detail.model || '') || preset !== (config.agent_preset || detail.agent_preset || '') || JSON.stringify(parsedMemory) !== JSON.stringify(config.memory_scope || PMParse(config.memory_scope_json, {}));
+  const needsMajor = prompt.trim() !== initialPrompt.trim() || model !== (config.model || detail.model || '') || preset !== (config.agent_preset || detail.agent_preset || '') || JSON.stringify(parsedMemory) !== JSON.stringify(config.memory_scope || PMParse(config.memory_scope_json, {}));
   const reset = () => {
     setResponsibility(detail.responsibility || config.responsibility || '');
+    setPrompt(initialPrompt);
     setModel(config.model || detail.model || '');
     setPreset(config.agent_preset || detail.agent_preset || '');
     setMemory(initialMemory);
@@ -1984,12 +2019,12 @@ function PMMemberEditor({ detail, busy, onCommand }) {
     PMClearDraft(prefix);
     setEditing(false);
   };
-  const publish = () => state.execute('member/publishConfig', { memberId: detail.id, changeClass, responsibility: responsibility.trim(), model: model.trim() || null, agentPreset: preset.trim() || null, memoryScope: parsedMemory }, () => { PMClearDraft(prefix); setEditing(false); });
+  const publish = () => state.execute('member/publishConfig', { memberId: detail.id, changeClass, responsibility: responsibility.trim(), prompt: prompt.trim(), model: model.trim() || null, agentPreset: preset.trim() || null, memoryScope: parsedMemory }, () => { PMClearDraft(prefix); setEditing(false); });
   return h('section', { style: styles.card }, [
     h('div', { key: 'h', style: styles.row }, [
       h('strong', { key: 't' }, `配置 · 当前 v${detail.current_version}`),
       !canPublish
-        ? h('span', { key: 'ro', style: styles.muted }, '只读：当前成员配置需要成员管理权限')
+        ? h('span', { key: 'ro', style: styles.muted }, detail.subagent_session_id ? '这是宿主 subagent 的 HAMS 记录：职责与提示词可以查看/修改，但已创建的宿主会话不会因此改变。' : '只读：当前成员配置需要成员管理权限')
         : editing
           ? h('div', { key: 'acts', style: { display: 'flex', gap: 6 } }, [
               h(PMButton, { key: 'cancel', disabled: busy || state.pending, onClick: reset }, '取消'),
@@ -1999,6 +2034,7 @@ function PMMemberEditor({ detail, busy, onCommand }) {
     ]),
     h(ErrorBox, { key: 'err', error: state.error, onDismiss: state.dismiss }),
     h(PMInput, { key: 'resp', label: '职责', value: responsibility, onChange: setResponsibility, multiline: true, disabled: locked }),
+    h(PMInput, { key: 'prompt', label: '提示词（这个 bot 的人设；会注入它的会话）', value: prompt, onChange: setPrompt, multiline: true, disabled: locked, placeholder: '例如：你只做告警复查，先看证据再下结论；不要替人关单。' }),
     h('div', { key: 'g', style: styles.grid }, [
       h(ModelSelect, { key: 'model', catalog, value: model, onChange: setModel, disabled: locked, labelKeys: { model: '模型' } }),
       h(PresetSelect, { key: 'preset', catalog, value: preset, onChange: setPreset, disabled: locked }),
@@ -2007,7 +2043,7 @@ function PMMemberEditor({ detail, busy, onCommand }) {
     !validMemory && editing ? h('span', { key: 'invalid', style: { color: C.warn } }, '记忆范围必须是有效的 JSON 对象。') : null,
     h('fieldset', { key: 'class', disabled: locked, style: { border: 'none', borderRadius: 8, background: C.tint, padding: '8px 12px', display: 'flex', gap: 12 } }, [h('legend', { key: 'l', style: styles.muted }, '变更级别'), ...[['minor', '小改'], ['major', '大改']].map(([value, label]) => h('label', { key: value }, [h('input', { key: 'i', type: 'radio', name: `change-${detail.id}`, checked: changeClass === value, disabled: locked, onChange: () => setChangeClass(value) }), label]))]),
     h('div', { key: 'impact', style: { ...styles.muted, lineHeight: 1.8 } }, changeClass === 'major' ? '大改：相关工作项下次运行前自动换新会话，旧会话只读保留。正在运行的执行继续使用冻结版本。' : '小改：已有会话继续使用原配置，可在工作项详情手动换新会话。正在运行的执行继续使用冻结版本。'),
-    needsMajor && changeClass === 'minor' && editing ? h('span', { key: 'major', style: { color: C.warn } }, '模型、preset 或记忆范围已变化，请选择大改。重写职责、换技能版本也应选择大改。') : null,
+    needsMajor && changeClass === 'minor' && editing ? h('span', { key: 'major', style: { color: C.warn } }, '提示词、模型、preset 或记忆范围已变化，请选择大改（改提示词必须换新会话才会生效）。') : null,
     !editing && canPublish ? h('span', { key: 'hint', style: styles.muted }, '点右上「编辑」修改；保存会发布一个新版本，正在运行的执行继续使用冻结版本。') : null,
   ]);
 }
@@ -2514,7 +2550,7 @@ function MemberScreen({ members = [], detail, positions = [], busy, formOpen, fi
     }
 
     function initialRoute() {
-      try { const q=new URLSearchParams(window.location.search);return {module:NAV.some(([key])=>key===q.get('hamsView'))?q.get('hamsView'):'overview',item:q.get('hamsItem'),project:q.get('hamsProject')}; } catch { return {module:'overview'}; }
+      try { const q=new URLSearchParams(window.location.search);return {module:NAV.some(([key])=>key===q.get('hamsView'))?q.get('hamsView'):'overview',item:q.get('hamsItem'),member:q.get('hamsMember'),project:q.get('hamsProject')}; } catch { return {module:'overview'}; }
     }
     function HamsPanel() {
       const [module,setModuleState]=React.useState(()=>initialRoute().module);
@@ -2523,7 +2559,7 @@ function MemberScreen({ members = [], detail, positions = [], busy, formOpen, fi
       const [createOpen,setCreateOpen]=React.useState(false);const [evidenceForm,setEvidenceForm]=React.useState(null);const [actionForm,setActionForm]=React.useState(null);
       const [whoami,setWhoami]=React.useState(null);const [templates,setTemplates]=React.useState([]);const [checks,setChecks]=React.useState([]);
       const [projects,setProjects]=React.useState([]);const [projectSel,setProjectSel]=React.useState(null);const [projectForm,setProjectForm]=React.useState(false);const [projectDraft,setProjectDraft]=React.useState(null);const [taskProject,setTaskProject]=React.useState('');
-      const [members,setMembers]=React.useState([]);const [memberSel,setMemberSel]=React.useState(null);const [positions,setPositions]=React.useState([]);const [memberForm,setMemberForm]=React.useState(false);const [memberFilter,setMemberFilter]=React.useState('all');
+      const [members,setMembers]=React.useState([]);const [memberSel,setMemberSel]=React.useState(null);const [memberTab,setMemberTab]=React.useState(null);const [positions,setPositions]=React.useState([]);const [memberForm,setMemberForm]=React.useState(false);const [memberFilter,setMemberFilter]=React.useState('all');
       const [knowledge,setKnowledge]=React.useState(null);const [knowledgeSel,setKnowledgeSel]=React.useState(null);const [knowledgeForm,setKnowledgeForm]=React.useState(null);const [knowledgeReport,setKnowledgeReport]=React.useState(null);const [importReport,setImportReport]=React.useState(null);const [editingDoc,setEditingDoc]=React.useState(false);
       const [approval,setApproval]=React.useState(null);const [approvalItem,setApprovalItem]=React.useState(null);
       const [health,setHealth]=React.useState(null);const [search,setSearch]=React.useState('');
@@ -2532,7 +2568,7 @@ function MemberScreen({ members = [], detail, positions = [], busy, formOpen, fi
       const caps=(whoami && whoami.capabilities) || [];const me=whoami && whoami.principal && whoami.principal.memberId;
       const readOnly=!!(health && health.readOnly);
       const can=cap=>caps.includes(cap);
-      const setModule=key=>{live.current.view=key;setModuleState(key);try{const url=new URL(window.location.href);url.searchParams.set('hamsView',key);if(key!=='tasks')url.searchParams.delete('hamsItem');if(key!=='projects')url.searchParams.delete('hamsProject');window.history.replaceState(null,'',url);}catch{}};
+      const setModule=key=>{live.current.view=key;setModuleState(key);try{const url=new URL(window.location.href);url.searchParams.set('hamsView',key);if(key!=='tasks')url.searchParams.delete('hamsItem');if(key!=='projects')url.searchParams.delete('hamsProject');if(key!=='agents')url.searchParams.delete('hamsMember');window.history.replaceState(null,'',url);}catch{}};
       const setDeepLink=(key,id)=>{try{const url=new URL(window.location.href);url.searchParams.set(key,id);window.history.replaceState(null,'',url);}catch{}};
       const refresh=async()=>{
         const epoch=++readSeq.current.refresh;
@@ -2565,10 +2601,10 @@ function MemberScreen({ members = [], detail, positions = [], busy, formOpen, fi
       };
       const openTask=id=>{live.current.item=id;setModule('tasks');setDeepLink('hamsItem',id);setSelected(null);return loadDetail('item','workItem/get',id,setSelected);};
       const openProject=id=>{live.current.project=id;setModule('projects');setDeepLink('hamsProject',id);setProjectDraft(null);setProjectSel(null);return loadDetail('project','project/get',id,setProjectSel);};
-      const openMember=id=>{live.current.member=id;setModule('agents');setMemberSel(null);return loadDetail('member','member/get',id,setMemberSel);};
+      const openMember=(id,tab)=>{live.current.member=id;setMemberTab(tab||null);setModule('agents');setDeepLink('hamsMember',id);setMemberSel(null);return loadDetail('member','member/get',id,setMemberSel);};
       const openKnowledge=(kind,id)=>{setEditingDoc(false);setKnowledgeSel(null);return loadDetail('knowledge','knowledge/get',null,setKnowledgeSel,{kind,id});};
       React.useEffect(()=>{
-        mounted.current=true;refresh();const route=initialRoute();if(route.module==='tasks' && route.item)openTask(route.item);else if(route.module==='projects' && route.project)openProject(route.project);
+        mounted.current=true;refresh();const route=initialRoute();if(route.module==='tasks' && route.item)openTask(route.item);else if(route.module==='projects' && route.project)openProject(route.project);else if(route.module==='agents' && route.member)openMember(route.member,'config');
         const timer=setInterval(()=>{if(!locked.current)refresh();},15000);
         return ()=>{mounted.current=false;clearInterval(timer);};
       },[]);
@@ -2679,8 +2715,8 @@ function MemberScreen({ members = [], detail, positions = [], busy, formOpen, fi
           ]):null,
           module==='overview'?h(OverviewTab,{key:'overview',overview,projects,templates,me,busy:busy || readOnly,onOpenApproval,onOpenTask:openTask,onProposal,onReview:review=>openProject(review.projectId || review.project_id)}):null,
           module==='tasks'?h(ItemsTab,{key:'tasks',items,selected,onSelect:openTask,onAct,busy,onCreate,createOpen,onCreateOpen:()=>setCreateOpen(!createOpen),onCreateCancel:()=>setCreateOpen(false),canAct:!readOnly,canCreate:!readOnly && can('work_item.create'),evidenceForm,actionForm,templates,projects,members,checks,me,projectFilter:taskProject,onProjectFilter:setTaskProject,onClose:()=>{readSeq.current.item++;live.current.item=null;setSelected(null);try{const url=new URL(window.location.href);url.searchParams.delete('hamsItem');window.history.replaceState(null,'',url);}catch{}},onCheck}):null,
-          module==='projects'?h(ProjectScreen,{key:'projects',projects:filteredProjects,detail:readOnly && projectSel?{...projectSel,allowedActions:[]}:projectSel,busy:busy || readOnly,formOpen:projectForm,draft:projectDraft,bots,members,humans:members.filter(m=>m.kind==='human'),me,allowedActions:!readOnly && can('project.create')?['create']:[],onCreate:onCreateProject,onOpen:openProject,onFormOpen:()=>{clearDraft('pm/project-create/');setProjectDraft(null);setProjectForm(!projectForm);},onStatus:onProjectStatus,onRecord:onRecordMetric,onCommand:projectCommand,onSaveDraft:onSaveProjectDraft,onPublish:onPublishProjectDraft,onContinueDraft:onContinueProjectDraft,onDelete:()=>{setProjectSel(null);},onRefreshDetail:()=>{if(live.current.project)loadDetail('project','project/get',live.current.project,setProjectSel);},onGotoTasks:id=>{setTaskProject(id || (projectSel && projectSel.id) || '');setModule('tasks');setCreateOpen(true);},onOpenTask:openTask,onOpenWorkItem:openTask,onClose:()=>{setProjectDraft(null);setProjectForm(false);setProjectSel(null);live.current.project=null;try{const url=new URL(window.location.href);url.searchParams.delete('hamsProject');window.history.replaceState(null,'',url);}catch{}}}):null,
-          module==='agents'?h(MemberScreen,{key:'members',members,detail:readOnly && memberSel?{...memberSel,allowedActions:[]}:memberSel,positions,onOpenWorkItem:openTask,busy:busy || readOnly,allowedActions:!readOnly && can('member.manage')?['create']:[],formOpen:memberForm,filter:memberFilter,onFilter:setMemberFilter,onCreate:onCreateMember,onOpen:openMember,onFormOpen:()=>setMemberForm(!memberForm),onStatus:onMemberStatus,onCommand:memberCommand,onClose:()=>{setMemberSel(null);live.current.member=null;}}):null,
+          module==='projects'?h(ProjectScreen,{key:'projects',projects:filteredProjects,detail:readOnly && projectSel?{...projectSel,allowedActions:[]}:projectSel,busy:busy || readOnly,formOpen:projectForm,draft:projectDraft,bots,members,humans:members.filter(m=>m.kind==='human'),me,allowedActions:!readOnly && can('project.create')?['create']:[],onCreate:onCreateProject,onOpen:openProject,onFormOpen:()=>{clearDraft('pm/project-create/');setProjectDraft(null);setProjectForm(!projectForm);},onStatus:onProjectStatus,onRecord:onRecordMetric,onCommand:projectCommand,onSaveDraft:onSaveProjectDraft,onPublish:onPublishProjectDraft,onContinueDraft:onContinueProjectDraft,onDelete:()=>{setProjectSel(null);},onRefreshDetail:()=>{if(live.current.project)loadDetail('project','project/get',live.current.project,setProjectSel);},onGotoTasks:id=>{setTaskProject(id || (projectSel && projectSel.id) || '');setModule('tasks');setCreateOpen(true);},onOpenTask:openTask,onOpenWorkItem:openTask,onOpenMember:openMember,onClose:()=>{setProjectDraft(null);setProjectForm(false);setProjectSel(null);live.current.project=null;try{const url=new URL(window.location.href);url.searchParams.delete('hamsProject');window.history.replaceState(null,'',url);}catch{}}}):null,
+          module==='agents'?h(MemberScreen,{key:'members',members,detail:readOnly && memberSel?{...memberSel,allowedActions:[]}:memberSel,positions,onOpenWorkItem:openTask,busy:busy || readOnly,allowedActions:!readOnly && can('member.manage')?['create']:[],formOpen:memberForm,filter:memberFilter,onFilter:setMemberFilter,onCreate:onCreateMember,onOpen:openMember,onFormOpen:()=>setMemberForm(!memberForm),onStatus:onMemberStatus,onCommand:memberCommand,initialTab:memberTab,onClose:()=>{setMemberSel(null);setMemberTab(null);live.current.member=null;try{const url=new URL(window.location.href);url.searchParams.delete('hamsMember');window.history.replaceState(null,'',url);}catch{}}}):null,
           module==='knowledge'?h(KnowledgeScreen,{key:'knowledge',data:knowledge,detail:knowledgeSel,busy,form:knowledgeForm,report:knowledgeReport,importReport,onForm:next=>{setKnowledgeForm(next);setEditingDoc(next==='edit');},onOpen:openKnowledge,onSync:onSyncKnowledge,onCreateDoc,onImport:onImportDocs,onPublish:onPublishDoc,onEdit:onEditDoc,editing:editingDoc,onCancelEdit:()=>setEditingDoc(false),capabilities:readOnly?[]:caps}):null,
           ]),
         ]),

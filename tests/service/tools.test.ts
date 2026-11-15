@@ -9,6 +9,7 @@ const SESSION_OWNERS = new Map<string, string>([
   ['tool-session-3', IDS.bot],
   ['tool-session-4', IDS.bot],
   ['tool-session-5', IDS.bot],
+  ['tool-session-coord', IDS.coord],
 ])
 
 function makeTools(h: ReturnType<typeof createHarness>, options: Record<string, unknown> = {}): ToolDefinition[] {
@@ -40,6 +41,44 @@ test('g01 工具清单：只有窄语义业务工具，没有审批 / 决定 / �
     assert.ok(item.description.length > 10, `${item.name} 缺少说明`)
     assert.equal(item.parameters.type, 'object')
   }
+  h.close()
+})
+
+test('g01b hams_create_work_item：推进 bot 建本项目工作项，非推进 bot 没有权限', () => {
+  const h = createHarness(test)
+  const tools = makeTools(h)
+  const created = tool(tools, 'hams_create_work_item').execute(
+    { projectId: IDS.project, title: '汇总本周告警', domain: '安全', category: '巡检' },
+    { sessionId: 'tool-session-coord' },
+  )
+  assert.equal(created.ok, true)
+  const data = created.data as { objectId: string }
+  const item = h.service.getWorkItem(h.ctx(IDS.owner), data.objectId)
+  assert.equal(item.project_id, IDS.project)
+  assert.equal(item.owner_human_id, IDS.owner)
+  assert.equal(item.title, '汇总本周告警')
+
+  const denied = tool(tools, 'hams_create_work_item').execute(
+    { projectId: IDS.project, title: '越权建单' },
+    { sessionId: 'tool-session-1' },
+  )
+  assert.equal(denied.ok, false)
+  assert.equal(denied.error?.code, 'POLICY_DENIED')
+  h.close()
+})
+
+test('g01c 指派成功后立刻回调派发器（不阻塞工具返回）', () => {
+  const h = createHarness(test)
+  const assigned: string[] = []
+  const tools = makeTools(h, { onAssigned: (id: string) => assigned.push(id) })
+  const ingested = h.service.ingestAlert(h.ctx('system', 'system'), alertInput())
+  const workItemId = ingested.objectId as string
+  const result = tool(tools, 'hams_assign_task').execute(
+    { id: workItemId, assigneeId: IDS.coord },
+    { sessionId: 'tool-session-coord' },
+  )
+  assert.equal(result.ok, true)
+  assert.deepEqual(assigned, [workItemId])
   h.close()
 })
 

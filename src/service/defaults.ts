@@ -118,9 +118,9 @@ export function ensureDefaultBots(db: DatabaseSync, ids: IdFactory, now: number,
   )
   const insertVersion = db.prepare(
     `INSERT INTO member_version
-       (id, member_id, version, agent_preset, model, memory_scope_json, prompt_digest,
+       (id, member_id, version, agent_preset, model, memory_scope_json, prompt, prompt_digest,
         change_class, published_by, published_at)
-     VALUES (?, ?, 1, 'hams-bot', NULL, '{}', ?, 'major', ?, ?)`,
+     VALUES (?, ?, 1, 'hams-bot', NULL, '{}', ?, ?, 'major', ?, ?)`,
   )
   const grant = db.prepare(
     'INSERT OR IGNORE INTO member_permission (member_id, capability, scope, granted_by, granted_at) VALUES (?, ?, ?, ?, ?)',
@@ -143,7 +143,7 @@ export function ensureDefaultBots(db: DatabaseSync, ids: IdFactory, now: number,
       now,
       now,
     )
-    insertVersion.run(ids(), spec.id, digest, ownerHumanId, now)
+    insertVersion.run(ids(), spec.id, spec.responsibility, digest, ownerHumanId, now)
     for (const capability of spec.capabilities) grant.run(spec.id, capability, 'global', ownerHumanId, now)
     result.created.push({ key: spec.id, id: spec.id, name: spec.name })
   }

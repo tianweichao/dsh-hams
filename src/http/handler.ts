@@ -886,6 +886,7 @@ const ROUTES = new Map<string, Route>([
           ownerHumanId: optionalString(payload.ownerHumanId, 'payload.ownerHumanId'),
           agentPreset: optionalString(payload.agentPreset, 'payload.agentPreset'),
           model: optionalString(payload.model, 'payload.model'),
+          prompt: optionalString(payload.prompt, 'payload.prompt'),
           capabilities: stringArray(payload.capabilities, 'payload.capabilities'),
           scope: optionalString(payload.scope, 'payload.scope'),
         })

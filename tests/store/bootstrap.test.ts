@@ -23,11 +23,11 @@ function boot(root: string, options: Partial<BootstrapOptions> = {}) {
   })
 }
 
-// 自定义一版迁移，用来测「已有库升级」路径：真实链到 v8 就停了。
-const V5: Migration = { version: 9, name: 'p9-test', sql: 'CREATE TABLE kb_test (id TEXT PRIMARY KEY);' }
+// 自定义一版迁移，用来测「已有库升级」路径：真实链到 v9 就停了。
+const V5: Migration = { version: 10, name: 'p10-test', sql: 'CREATE TABLE kb_test (id TEXT PRIMARY KEY);' }
 const UPGRADE_CHAIN: Migration[] = [...MIGRATIONS, V5]
 
-test('t01 空目录首次启动：拿锁 → 建库到 v8 → 种子 → 启动代次 1', () => {
+test('t01 空目录首次启动：拿锁 → 建库到 v9 → 种子 → 启动代次 1', () => {
   const root = createSandbox(test)
   const runtime = boot(root)
 
@@ -35,13 +35,13 @@ test('t01 空目录首次启动：拿锁 → 建库到 v8 → 种子 → 启动�
     'acquire-lock',
     'open-db',
     'skip-backup-fresh-db',
-    'migrate:1,2,3,4,5,6,7,8',
+    'migrate:1,2,3,4,5,6,7,8,9',
     'seed-meta',
     'assert-baseline-seed',
     'bump-runtime-epoch:1',
   ])
   assert.equal(runtime.report.fromVersion, 0)
-  assert.equal(runtime.report.toVersion, 8)
+  assert.equal(runtime.report.toVersion, 9)
   assert.equal(runtime.report.runtimeEpoch, 1)
   assert.equal(runtime.report.backup, null, '空库迁移不制造无意义的备份')
   assert.equal(runtime.report.seed.tables, 58)
@@ -65,7 +65,7 @@ test('t02 二次启动：不迁移、不动数据、启动代次 +1', () => {
   first.close()
 
   const second = boot(root, { now: () => T0 + 1_000 })
-  assert.equal(second.report.fromVersion, 8)
+  assert.equal(second.report.fromVersion, 9)
   assert.equal(second.report.migration.migrated, false)
   assert.deepEqual(second.report.steps, [
     'acquire-lock',
@@ -101,9 +101,9 @@ test('t04 版本升级：先做可校验的事前备份，再迁移', () => {
   v1.close()
 
   const upgraded = boot(root, { migrations: UPGRADE_CHAIN, backupKeep: 3 })
-  assert.equal(upgraded.report.fromVersion, 8)
-  assert.equal(upgraded.report.toVersion, 9)
-  assert.deepEqual(upgraded.report.migration.applied.map((item) => item.version), [9])
+  assert.equal(upgraded.report.fromVersion, 9)
+  assert.equal(upgraded.report.toVersion, 10)
+  assert.deepEqual(upgraded.report.migration.applied.map((item) => item.version), [10])
   assert.ok(upgraded.report.steps.includes('backup-before-migrate:' + upgraded.report.backup?.name))
 
   const backup = upgraded.report.backup
@@ -111,7 +111,7 @@ test('t04 版本升级：先做可校验的事前备份，再迁移', () => {
   assert.equal(backup.tables, 58)
 
   const copy = new DatabaseSync(backup.path, { readOnly: true })
-  assert.equal(userVersion(copy), 8, '备份必须是迁移前的版本')
+  assert.equal(userVersion(copy), 9, '备份必须是迁移前的版本')
   const copyTables = copy
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
     .all()
@@ -119,8 +119,8 @@ test('t04 版本升级：先做可校验的事前备份，再迁移', () => {
   assert.ok(!copyTables.includes('kb_test'), '备份里不应出现迁移后的新表')
   copy.close()
 
-  assert.equal(userVersion(upgraded.db), 9)
-  assert.equal(upgraded.report.meta.schema_version, '9', 'hams_meta 的 schema_version 要跟着迁移走')
+  assert.equal(userVersion(upgraded.db), 10)
+  assert.equal(upgraded.report.meta.schema_version, '10', 'hams_meta 的 schema_version 要跟着迁移走')
   upgraded.close()
 })
 
@@ -135,8 +135,8 @@ test('t05 备份失败就不迁移：宁可起不来也不越过备份', () => {
 
   assert.throws(() => boot(root, { migrations: UPGRADE_CHAIN }), /EEXIST|ENOTDIR|not a directory/i)
 
-  const reader = openReadOnlyStore(dataDir, 8)
-  assert.equal(reader.userVersion, 8)
+  const reader = openReadOnlyStore(dataDir, 9)
+  assert.equal(reader.userVersion, 9)
   const tables = reader.db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
     .all()
@@ -150,13 +150,13 @@ test('t06 只读实例：版本不符拒绝打开，且写不进去', () => {
   const root = createSandbox(test)
   const dataDir = sandboxPath(root, 'data')
 
-  assert.throws(() => openReadOnlyStore(dataDir, 8), /unable to open|Cannot open|SQLITE_CANTOPEN/i)
+  assert.throws(() => openReadOnlyStore(dataDir, 9), /unable to open|Cannot open|SQLITE_CANTOPEN/i)
 
   const runtime = boot(root)
   runtime.close()
 
-  const reader = openReadOnlyStore(dataDir, 8)
-  assert.equal(reader.userVersion, 8)
+  const reader = openReadOnlyStore(dataDir, 9)
+  assert.equal(reader.userVersion, 9)
   assert.throws(() => reader.db.prepare("INSERT INTO hams_meta (key, value) VALUES ('x','1')").run())
   reader.close()
 })
@@ -168,7 +168,7 @@ test('t07 只读实例遇到更高版本库：报 SCHEMA_TOO_NEW', () => {
   runtime.close()
 
   assert.throws(
-    () => openReadOnlyStore(sandboxPath(root, 'data'), 8),
+    () => openReadOnlyStore(sandboxPath(root, 'data'), 9),
     (error: unknown) => (error as { code?: string }).code === 'SCHEMA_TOO_NEW',
   )
 })

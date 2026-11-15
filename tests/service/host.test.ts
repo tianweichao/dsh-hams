@@ -114,7 +114,7 @@ const CONFIG = {
   toolsEnabled: true,
 } as const
 
-test('p01 注册全部精确路由与 15 个工具，路径/名字与契约一致', () => {
+test('p01 注册全部精确路由与 16 个工具，路径/名字与契约一致', () => {
   const root = createSandbox(test)
   const dataDir = prepareDataDir(root)
   const { ctx, routes, tools } = fakeCtx()
@@ -127,7 +127,7 @@ test('p01 注册全部精确路由与 15 个工具，路径/名字与契约一�
       assert.equal(spec.kind, 'exact', `${path} 必须是精确匹配`)
       assert.ok(path.startsWith('/hams/api/v1/'))
     }
-    assert.equal(tools.length, 15)
+    assert.equal(tools.length, 16)
     assert.deepEqual(registered.toolNames.sort(), tools.map((tool) => tool.name).sort())
     assert.ok(!tools.some((tool) => tool.name.includes('decide') || tool.name.includes('close')))
   } finally {

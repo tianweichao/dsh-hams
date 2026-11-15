@@ -76,6 +76,38 @@ test('c01 单聊：打开即建线程指针，再次打开复用，发送落到�
   assert.equal(read.thread?.sessionId, first.sessionId)
 })
 
+test('c06b 群聊自动建单：识别为新活时先登记，并把工作项 id 提示给推进 bot', async () => {
+  const h = createHarness(test)
+  const runtime = fakeRuntime()
+  const seen: Array<Record<string, unknown>> = []
+  const chat = new ChatService({
+    db: h.db,
+    runtime,
+    intake: {
+      async registerFromMessage(input) {
+        seen.push(input as never)
+        return { kind: 'create', workItemId: 'wi-auto-1', title: 'A 股最新行情调研', created: true }
+      },
+    },
+  })
+  const sent = await chat.groupSend(h.ctx(IDS.owner), { projectId: IDS.project, text: '帮我查一下 A 股最新行情' })
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0].projectId, IDS.project)
+  assert.equal(seen[0].senderId, IDS.owner)
+  assert.equal(seen[0].mentionedMemberId, null)
+
+  const delivered = runtime.sent.at(-1)!.text
+  assert.match(delivered, /工作项 wi-auto-1/)
+  assert.match(delivered, /不要重复建单/)
+
+  const view = await chat.groupRead(h.ctx(IDS.owner), { projectId: IDS.project })
+  const system = view.messages.find((message) => message.kind === 'system')
+  assert.ok(system, '群里要留一条系统记录')
+  assert.match(system!.text, /已把这条消息登记为工作项/)
+  assert.equal(sent.mentions.length, 0)
+  h.close()
+})
+
 test('c02 配置换了（大改版本）就换新会话；群聊绑定项目推进 bot', async () => {
   const h = createHarness(test)
   const runtime = fakeRuntime()
@@ -181,6 +213,46 @@ test('c06 HTTP：对话命令是异步路由，写命令要幂等键，读命令
   const noChat = createHamsHttpHandler({ service: h.service, authenticate: () => ({ ok: true, principalId: IDS.owner }) })
   const unavailable = (await noChat({ method: 'POST', path: '/hams/api/v1/chat/messages', headers: {}, body: JSON.stringify({ commandId: 'c4', payload: { kind: 'member', targetId: IDS.coord } }) })) as any
   assert.equal(JSON.parse(unavailable.body).data.available, false)
+})
+
+test('c06d 识别为状态更新：群里留系统记录，并告诉 bot 不要重复处理', async () => {
+  const h = createHarness(test)
+  const runtime = fakeRuntime()
+  const chat = new ChatService({
+    db: h.db,
+    runtime,
+    intake: {
+      async registerFromMessage() {
+        return { kind: 'update', workItemId: 'wi-1', title: 'A 股行情调研', status: 'paused', changed: true }
+      },
+    },
+  })
+  await chat.groupSend(h.ctx(IDS.owner), { projectId: IDS.project, text: '把 A 股那条先暂停' })
+  const view = await chat.groupRead(h.ctx(IDS.owner), { projectId: IDS.project })
+  assert.ok(view.messages.some((message) => message.kind === 'system' && /状态改为「暂停」/.test(message.text)))
+  assert.match(runtime.sent.at(-1)!.text, /不要再重复处理/)
+  h.close()
+})
+
+test('c06c 单聊自动建单：bot 只推进一个项目时按该项目登记，并把工作项提示给 bot', async () => {
+  const h = createHarness(test)
+  const runtime = fakeRuntime()
+  const seen: Array<Record<string, unknown>> = []
+  const chat = new ChatService({
+    db: h.db,
+    runtime,
+    intake: {
+      async registerFromMessage(input) {
+        seen.push(input as never)
+        return { kind: 'create', workItemId: 'wi-dm-1', title: 'A 股行情调研', created: true }
+      },
+    },
+  })
+  await chat.send(h.ctx(IDS.owner), { kind: 'member', targetId: IDS.coord, text: '帮我查一下 A 股最新行情' })
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0].projectId, IDS.project, '推进 bot 只推进一个项目时按这个项目建单')
+  assert.match(runtime.sent.at(-1)!.text, /工作项 wi-dm-1/)
+  h.close()
 })
 
 test('c07 没模型：宿主默认模型兜底；两边都没有就明确拒绝，而不是建一个发不出声的会话', async () => {

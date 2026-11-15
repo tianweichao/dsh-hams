@@ -71,7 +71,7 @@ test('t02 v1 的每个对象都与权威 DDL 的同名对象逐字一致', () =>
 
   const handWrittenTables = new Set<string>([...TEAM_SCHEMA_META.tableNames, ...TARGET_CHECK_SCHEMA_META.tableNames, ...MEMORY_SCHEMA_META.tableNames])
   // 后加列会改写 sqlite_master 里的建表原文，逐字比较只对被改动前的列有意义。
-  const alteredTables = new Set(['member', 'project', 'project_phase_target', 'project_phase_target_check'])
+  const alteredTables = new Set(['member', 'member_version', 'project', 'project_phase_target', 'project_phase_target_check'])
   const handWrittenIndexes = new Set(['idx_project_participant_active', 'idx_project_message_project', 'idx_phase_target_check_target', 'idx_project_memory_project', 'idx_bot_memory_member'])
   for (const [key, sql] of p1Objects) {
     const name = key.slice(key.indexOf(':') + 1)

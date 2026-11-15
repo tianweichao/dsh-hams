@@ -118,7 +118,7 @@ test('h04 读接口：列表、详情含 allowedActions、健康检查', () => {
   const health = call(handler, '/hams/api/v1/ops/health', { commandId: 'c3' })
   assert.equal(health.body.data.counts.workItems, 1)
   assert.equal(health.body.data.counts.openWorkItems, 1)
-  assert.equal(health.body.data.schemaVersion, 8)
+  assert.equal(health.body.data.schemaVersion, 9)
   h.close()
 })
 

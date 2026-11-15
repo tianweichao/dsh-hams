@@ -41,6 +41,12 @@ export const Config = z
       hostSession: z.union([z.const('auto'), z.const('require'), z.const('off')]).default('auto'),
       /** 知识屏扫描的真实技能目录；空 = $DSH_HOME/skills */
       knowledgeSkillDirs: z.array(z.string()).default([]),
+      /** 群聊里人类的任务请求自动登记成工作项；默认开 */
+      autoIntake: z.boolean().default(true),
+      /** 识别器模型；空 = 宿主默认模型 */
+      intakeModel: z.string().default(''),
+      /** 识别器推理强度；空 = 自动最低档 */
+      intakeReasoningEffort: z.string().default(''),
       /** 工作区画像文件；空 = $DSH_HOME/hams/workspace-profile.json */
       workspaceProfileFile: z.string().default(''),
       /** 画像里相对路径的根；空 = 读画像里的 workspaceRoot */

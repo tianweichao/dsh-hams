@@ -199,7 +199,7 @@ test('v2实际库升级v4：保留项目/指标/审计，v3 的项目 DDL 仍逐
  db.prepare("INSERT INTO member (id,kind,name,role,created_at,updated_at) VALUES ('human','human','迁移负责人','coordinator',1,1)").run()
  db.prepare("INSERT INTO project (id,name,type,owner_human_id,goal_text,created_at,updated_at) VALUES ('old','已有项目','continuous','human','保存历史',1,1)").run()
  const report=migrate(db)
- assert.deepEqual(report.applied.map(m=>m.version),[3,4,5,6,7,8])
+ assert.deepEqual(report.applied.map(m=>m.version),[3,4,5,6,7,8,9])
  assert.equal((db.prepare("SELECT goal_text FROM project WHERE id='old'").get() as any).goal_text,'保存历史')
  assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='project_review'").all().length,1)
  const authority=parseSchema(readFileSync(new URL('../../docs/schema-2026-11-14.sql',import.meta.url),'utf8')).map(s=>s.text)

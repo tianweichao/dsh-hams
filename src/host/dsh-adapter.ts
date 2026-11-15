@@ -23,10 +23,13 @@ import { createHamsHttpHandler, API_PREFIX, ROUTE_PATHS, type AuthResult, type H
 import { createHamsTools, type ToolDefinition, type ToolExecContext } from '../service/tools.ts'
 import { createTicker, readRuntimeEpoch, recover, type TickerHandle } from '../service/tick.ts'
 import { ChatService } from '../service/chat.ts'
-import { createHostChatRuntime, ensureHamsBotPreset, parseModelChoice, resolveAgentOptions, HAMS_BOT_PRESET } from './chat-runtime.ts'
+import { createHostChatRuntime, parseModelChoice, resolveAgentOptions, HAMS_BOT_PRESET } from './chat-runtime.ts'
+import { resolveBotPreset } from './bot-preset.ts'
 import { HamsSessionAdapter } from './session-adapter.ts'
 import { ensureAllDefaultPlans } from '../service/project-lifecycle.ts'
 import { createIdFactory } from '../domain/ids.ts'
+import { createHash } from 'node:crypto'
+import { classifyWorkRequest, type IntakeModel, type LlmLike } from './intake-agent.ts'
 import { HamsError } from '../domain/errors.ts'
 import { ensureStarterTemplate } from '../service/templates.ts'
 import { ensureDefaultBots, type DefaultBotResult } from '../service/defaults.ts'
@@ -93,6 +96,8 @@ export interface HostContext {
   tools?: HostTools
   effect?: (fn: () => HostDisposer | void, label?: string) => unknown
   logger?: { info?: (...args: unknown[]) => void; warn?: (...args: unknown[]) => void }
+  /** Cordis 事件订阅；用来旁路观察 `subagent/descriptor`，把子代理登记进项目团队。 */
+  on?: (name: string, listener: (...args: any[]) => unknown) => HostDisposer | void
   /** Cordis 的服务读取入口。**必须**用它取 connection：直接读 `ctx.connection`
    *  在 Cordis 里会抛「cannot get property without inject」。 */
   get?: (name: string) => unknown
@@ -619,19 +624,180 @@ export function registerHams(ctx: HostContext, config: HamsHostConfig = {}): Reg
     mode === 'writer'
       ? createHostChatRuntime({ ctx, dataDir, log: (line) => ctx.logger?.warn?.(line) })
       : null
-  const chat = chatRuntime ? new ChatService({ db, runtime: chatRuntime }) : null
+  // 群聊/单聊的任务识别：独立的一次模型调用（不开工具、尽量关思考），由它判断
+  // 是「开一件新活」还是「改某个已有工作项状态」，再走 HAMS 的权限与命令。
+  const intake = chatRuntime && config.autoIntake !== false
+    ? {
+        async registerFromMessage(input: {
+          projectId: string
+          senderId: string
+          text: string
+          messageId: string
+          mentionedMemberId: string | null
+          recent?: string
+        }) {
+          const project = db
+            .prepare('SELECT id, name, owner_human_id, status FROM project WHERE id = ? AND deleted_at IS NULL')
+            .get(input.projectId) as
+            | { id: string; name: string; owner_human_id: string; status: string }
+            | undefined
+          if (!project || project.status !== 'active') return null
+          const sender = db.prepare('SELECT kind, status FROM member WHERE id = ?').get(input.senderId) as
+            | { kind: string; status: string }
+            | undefined
+          if (!sender || sender.kind !== 'human') return null
+          const llm = hostService<LlmLike>('llm')
+          if (!llm || typeof llm.stream !== 'function') return null
+
+          const selection = hostService<{ currentSelection?: () => { provider?: string; model?: string; reasoningEffort?: string } }>(
+            'agentDefaultModel',
+          )?.currentSelection?.()
+          let model: IntakeModel | null = null
+          if (config.intakeModel?.trim()) {
+            const parsed = await parseModelChoice(config.intakeModel, llm as never, selection?.provider)
+            if (parsed?.model) model = { provider: parsed.provider || selection?.provider || '', model: parsed.model, reasoningEffort: config.intakeReasoningEffort }
+          } else if (selection?.provider && selection.model) {
+            model = { provider: selection.provider, model: selection.model, reasoningEffort: config.intakeReasoningEffort }
+          }
+          if (!model?.provider) return null
+
+          const items = db
+            .prepare(
+              `SELECT w.id, w.title, w.status, m.name AS assignee
+                 FROM work_item w LEFT JOIN member m ON m.id = w.assignee_id
+                WHERE w.project_id = ? AND w.status NOT IN ('completed','cancelled')
+                ORDER BY w.updated_at DESC LIMIT 20`,
+            )
+            .all(project.id) as Array<{ id: string; title: string; status: string; assignee: string | null }>
+          const decision = await classifyWorkRequest({
+            llm,
+            model,
+            projectName: project.name,
+            workItems: items,
+            recent: input.recent,
+            message: input.text,
+          })
+          if (!decision || decision.action === 'none') return null
+
+          const base = {
+            principalId: input.senderId,
+            channel: 'ui' as const,
+            correlationId: `intake:${input.messageId}`,
+            idempotencyKey: `intake:${input.messageId}`,
+          }
+          if (decision.action === 'create') {
+            const dedupeKey = `intake:${project.id}:${createHash('sha256').update(decision.title.replace(/\s+/g, '')).digest('hex').slice(0, 16)}`
+            try {
+              const receipt = service.createWorkItem(base, {
+                projectId: project.id,
+                domain: '通用',
+                category: '群聊请求',
+                title: decision.title,
+                ownerHumanId: input.senderId,
+                dedupeKey,
+              })
+              const workItemId = String(receipt.objectId || '')
+              if (!workItemId) return null
+              if (input.mentionedMemberId && receipt.status === 'applied') {
+                try {
+                  service.assignWorkItem(
+                    { ...base, correlationId: `intake-assign:${input.messageId}` },
+                    { workItemId, memberId: input.mentionedMemberId },
+                  )
+                } catch {
+                  // 指派失败不影响建单；推进 bot 会在群里接着派。
+                }
+              }
+              return { kind: 'create' as const, workItemId, title: decision.title, created: receipt.status === 'applied' }
+            } catch (error) {
+              ctx.logger?.warn?.(`[hams] 识别建单失败：${String(error)}`)
+              return null
+            }
+          }
+
+          const item = db
+            .prepare('SELECT id, title, status FROM work_item WHERE id = ? AND project_id = ?')
+            .get(decision.workItemId, project.id) as { id: string; title: string; status: string } | undefined
+          if (!item || item.status === 'completed' || item.status === 'cancelled') return null
+          if (item.status === decision.status) {
+            return { kind: 'update' as const, workItemId: item.id, title: item.title, status: decision.status, changed: false }
+          }
+          try {
+            const reason = `群聊指令：${input.text.slice(0, 200)}`
+            if (decision.status === 'paused') service.pause(base, { workItemId: item.id, reason })
+            else if (decision.status === 'active') service.resume(base, { workItemId: item.id, reason })
+            else service.cancel(base, { workItemId: item.id, reason })
+          } catch (error) {
+            ctx.logger?.warn?.(`[hams] 识别改状态失败：${String(error)}`)
+            return null
+          }
+          return { kind: 'update' as const, workItemId: item.id, title: item.title, status: decision.status, changed: true }
+        },
+      }
+    : undefined
+  const chat = chatRuntime ? new ChatService({ db, runtime: chatRuntime, intake }) : null
   const disposers: HostDisposer[] = []
 
-  // bot 运行时：把工作项线程接到真实 agent 会话；服务缺失时只记日志，不影响面板启动。
-  const hostService = <T>(name: string): T | undefined => {
-    if (typeof ctx.get !== 'function') return undefined
-    try {
-      const found = ctx.get(name)
-      return found && typeof found === 'object' ? (found as T) : undefined
-    } catch {
-      return undefined
+  // bot 用 DSH 的 subagent 起的子代理不在 HAMS 成员表里：监听会话事件，按父会话反查项目，
+  // 自动登记成团队里的「子代理」。描述符给 label，第一条用户消息给这个子代理的任务提示词。
+  if (chat && typeof ctx.on === 'function') {
+    const labels = new Map<string, string>()
+    const textOf = (content: unknown): string => {
+      if (!Array.isArray(content)) return ''
+      return content
+        .filter((block) => block && typeof block === 'object' && (block as { type?: string }).type === 'text')
+        .map((block) => String((block as { text?: unknown }).text ?? ''))
+        .join('\n')
+        .trim()
+        .slice(0, 8192)
     }
+    const register = (childSessionId: string, parentSessionId: string, label: string, prompt: string): void => {
+      try {
+        chat.registerSubagent({ childSessionId, parentSessionId, label, prompt })
+      } catch (error) {
+        ctx.logger?.warn?.(`[hams] 登记子代理失败：${String(error)}`)
+      }
+    }
+    const off = ctx.on('session/event', (session: any, event: any) => {
+      const header = session?.header ?? session?.meta
+      if (!header || header.origin !== 'subagent' || !header.parentSession || !header.id) return
+      if (event?.type === 'subagent/descriptor') {
+        if (labels.size > 200) labels.clear()
+        labels.set(String(header.id), typeof event.data?.label === 'string' ? event.data.label : '')
+        return
+      }
+      if (event?.type !== 'user/message') return
+      if (event.data?.source?.kind !== 'user') return
+      if (Number(event.time || 0) < Number(header.createdAt || 0)) return
+      const prompt = textOf(event.data.content)
+      if (!prompt) return
+      const childSessionId = String(header.id)
+      const parentSessionId = String(header.parentSession)
+      const known = labels.get(childSessionId) || ''
+      if (known) {
+        register(childSessionId, parentSessionId, known, prompt)
+        labels.delete(childSessionId)
+        return
+      }
+      // 进程重启后描述符事件已经错过：异步读一次会话补 label，再登记。
+      void (async () => {
+        let label = ''
+        try {
+          const query = ctx.get?.('sessionQuery') as { readSession?(id: string): Promise<{ events?: readonly unknown[] }> } | undefined
+          const events = query?.readSession ? ((await query.readSession(childSessionId)).events ?? []) : []
+          const descriptor = events.find((item) => item && typeof item === 'object' && (item as { type?: string }).type === 'subagent/descriptor') as
+            | { data?: { label?: unknown } }
+            | undefined
+          label = typeof descriptor?.data?.label === 'string' ? descriptor.data.label : ''
+        } catch {
+          label = ''
+        }
+        register(childSessionId, parentSessionId, label, prompt)
+      })()
+    })
+    if (typeof off === 'function') disposers.push(off)
   }
+
   let sessionAdapter: HamsSessionAdapter | null = null
   if (mode === 'writer' && config.botRuntime !== false) {
     const agentsProxy = {
@@ -654,7 +820,12 @@ export function registerHams(ctx: HostContext, config: HamsHostConfig = {}): Reg
       agents: agentsProxy as never,
       createUserMessage: (input: Record<string, unknown>) => ({ id: `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`, role: 'user', ...input }),
       compose: async (bot) => {
-        const preset = bot.agentPreset && bot.agentPreset !== HAMS_BOT_PRESET ? bot.agentPreset : await ensureHamsBotPreset(ctx, (line) => ctx.logger?.warn?.(line))
+        // 成员版本里的人设提示词 → 独立 preset（工具与 hams-bot 共用）；配了别的宿主 preset 就尊重它。
+        const preset = await resolveBotPreset(
+          ctx,
+          { memberId: bot.memberId, memberName: bot.memberName, version: bot.version, prompt: bot.prompt, preset: bot.agentPreset },
+          (line) => ctx.logger?.warn?.(line),
+        )
         // bot 没配模型时用宿主默认模型兜底（否则会话一开就报 has no provider/model）。
         const selection = hostService<{ currentSelection?: () => { provider?: string; model?: string; reasoningEffort?: string } }>('agentDefaultModel')?.currentSelection?.()
         const model = await resolveAgentOptions(bot.model, hostService('llm') as never, selection)
@@ -710,15 +881,37 @@ export function registerHams(ctx: HostContext, config: HamsHostConfig = {}): Reg
   let dispatchTimer: ReturnType<typeof setInterval> | null = null
   if (sessionAdapter) {
     let dispatching = false
+    const writeMeta = (key: string, value: unknown) => {
+      try {
+        db.prepare('INSERT OR REPLACE INTO hams_meta (key, value) VALUES (?, ?)').run(key, typeof value === 'string' ? value : JSON.stringify(value))
+      } catch {
+        // 诊断写失败不影响派发
+      }
+    }
     dispatchTimer = setInterval(() => {
       if (dispatching) return
       dispatching = true
-      Promise.resolve()
+      const startedAt = Date.now()
+      writeMeta('dispatch:heartbeat', { at: startedAt, dispatching: true })
+      const cycle = Promise.resolve()
         .then(() => sessionAdapter!.dispatchAssignments())
-        .then((report) => { if (report.errors.length) ctx.logger?.warn?.(`[hams] 指派派发失败：${report.errors.slice(0, 3).join(' | ')}`) })
+        .then((report) => {
+          if (report.errors.length) ctx.logger?.warn?.(`[hams] 指派派发失败：${report.errors.slice(0, 3).join(' | ')}`)
+          writeMeta('dispatch:assign', { at: Date.now(), started: report.started, errors: report.errors.slice(0, 5) })
+        })
         .then(() => sessionAdapter!.dispatchQueued())
-        .catch((error) => ctx.logger?.warn?.(`[hams] 派发失败：${String(error)}`))
-        .finally(() => { dispatching = false })
+      const timeout = new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error('派发周期超时（60s）')), 60_000)
+      })
+      Promise.race([cycle, timeout])
+        .catch((error) => {
+          writeMeta('dispatch:error', { at: Date.now(), error: String(error) })
+          ctx.logger?.warn?.(`[hams] 派发失败：${String(error)}`)
+        })
+        .finally(() => {
+          dispatching = false
+          writeMeta('dispatch:heartbeat', { at: Date.now(), dispatching: false })
+        })
     }, Math.max(3000, config.tickMs ?? 5_000))
     if (typeof dispatchTimer === 'object' && dispatchTimer && 'unref' in dispatchTimer) dispatchTimer.unref()
   }
@@ -733,6 +926,14 @@ export function registerHams(ctx: HostContext, config: HamsHostConfig = {}): Reg
       resolveSessionOwner: config.defaultBotMemberId
         ? () => ({ memberId: config.defaultBotMemberId as string })
         : undefined,
+      onAssigned: () => {
+        if (!sessionAdapter) return
+        void sessionAdapter
+          .dispatchAssignments()
+          .then((report) => { if (report.errors.length) ctx.logger?.warn?.(`[hams] 指派即时派发失败：${report.errors.slice(0, 3).join(' | ')}`) })
+          .then(() => sessionAdapter!.dispatchQueued())
+          .catch((error) => ctx.logger?.warn?.(`[hams] 指派即时派发失败：${String(error)}`))
+      },
       ...(chat
         ? {
             chat: {

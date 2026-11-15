@@ -32,7 +32,7 @@ test('t01 备份产出可通过四项校验的副本，且能只读重开', () =
   assert.match(report.name, BACKUP_NAME_RE)
   assert.equal(report.integrity, 'ok')
   assert.ok(report.bytes > 0)
-  assert.equal(report.userVersion, 8)
+  assert.equal(report.userVersion, 9)
   assert.equal(report.tables, 58)
   assert.equal(report.rows.work_item_transition, 36)
   assert.deepEqual(report.pruned, [])

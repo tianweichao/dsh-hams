@@ -60,6 +60,8 @@ export interface ChatRuntime {
     memberName: string
     memberVersion: number
     agentPreset: string
+    /** 成员版本里的提示词；hams-bot 用它生成 persona，别的 preset 用它写上下文。 */
+    prompt?: string
     model: string | null
     title: string
     /** 首次建会话时注入的上下文（不显示在聊天记录里），告诉 bot 它是谁、在哪个项目里。 */
@@ -69,11 +71,41 @@ export interface ChatRuntime {
   read(sessionId: string): Promise<{ messages: ChatMessage[]; running: boolean; error?: string }>
   /** 群聊里单个成员是否在跑（没有会话就 false）。 */
   status?(sessionId: string): Promise<{ running: boolean; error?: string }>
+  /** 只看进程内存里的 agent 状态（不读会话日志）；团队页轮询用。 */
+  liveStatus?(sessionId: string): { live: boolean; running: boolean }
   /** 宿主当前默认模型；bot 没配模型时用它，而不是建一个注定报错的会话。 */
   defaultModel?(): Promise<{ provider: string; model: string } | null>
   stop(sessionId: string): Promise<void>
   presets(): Promise<ChatPresetRow[]>
   models(): Promise<ChatModelRow[]>
+  /** 会话目录（轻量 header），用来发现 bot 起的子代理；宿主没有就不做发现。 */
+  listSessions?(): Promise<Array<{ id: string; parentSession?: string; origin?: string; createdAt: number; cwd?: string }>>
+  /** 读一个会话的原始事件，用来取 `subagent/descriptor` 的 label。 */
+  readSessionEvents?(sessionId: string): Promise<readonly unknown[]>
+}
+
+/** 任务识别器的输出：开新活 / 改已有工作项状态 / 什么都不做。 */
+export type IntakeDecision =
+  | { action: 'create'; title: string; reason?: string }
+  | { action: 'update'; workItemId: string; status: 'paused' | 'active' | 'cancelled'; reason?: string }
+  | { action: 'none'; reason?: string }
+
+/** 识别器已经落地后的结果，用于给人类/bot 留可见记录。 */
+export type IntakeOutcome =
+  | { kind: 'create'; workItemId: string; title: string; created: boolean }
+  | { kind: 'update'; workItemId: string; title: string; status: 'paused' | 'active' | 'cancelled'; changed: boolean }
+
+/** 群聊/单聊的任务识别：由宿主侧接一个独立模型调用实现，ChatService 只等结果。 */
+export interface WorkIntake {
+  registerFromMessage(input: {
+    projectId: string
+    senderId: string
+    text: string
+    messageId: string
+    mentionedMemberId: string | null
+    /** 最近几条群聊/单聊，帮模型理解「这个/刚才」。 */
+    recent?: string
+  }): Promise<IntakeOutcome | null>
 }
 
 export interface ChatPeer {
@@ -85,6 +117,8 @@ export interface ChatPeer {
   memberVersion: number
   agentPreset: string
   model: string | null
+  /** 当前版本的人设提示词。 */
+  prompt: string
 }
 
 export interface ChatThreadView extends ChatPeer {
@@ -99,11 +133,13 @@ interface ThreadPointer {
   memberVersion: number
   agentPreset: string
   model: string | null
+  /** 建会话时冻结的提示词；读历史/恢复会话时用。 */
+  prompt?: string
   at: number
 }
 
 
-export type TeamKind = 'coordinator' | 'member' | 'temp'
+export type TeamKind = 'coordinator' | 'member' | 'temp' | 'subagent'
 
 export interface TeamMemberView {
   memberId: string
@@ -140,6 +176,35 @@ export interface GroupChatView {
 
 const DEFAULT_BOT_PRESET = 'hams-bot'
 
+/**
+ * 成员配了别的宿主 preset 时，人设不由 hams-bot 提供，把提示词写进会话上下文；
+ * 默认 hams-bot 由 `bot-preset.ts` 直接生成 persona，不再重复注入。
+ */
+function promptContextBlock(prompt: string | null | undefined, preset: string): string {
+  const text = String(prompt || '').trim()
+  if (!text || !preset || preset === DEFAULT_BOT_PRESET) return ''
+  return `\n【你的设定（成员配置发布；与通用说明冲突时以这里为准）】\n${text}`
+}
+
+/** 子代理自己的任务提示词：第一条「创建之后、source=user」的消息。fork 继承的历史早于 createdAt，不会被误取。 */
+function subagentTaskPrompt(events: readonly unknown[], createdAt: number): string {
+  for (const raw of events) {
+    if (!raw || typeof raw !== 'object') continue
+    const event = raw as { type?: string; time?: number; data?: { source?: { kind?: string }; content?: unknown } }
+    if (event.type !== 'user/message') continue
+    if (event.data?.source?.kind !== 'user') continue
+    if (Number(event.time || 0) < Number(createdAt || 0)) continue
+    const content = Array.isArray(event.data.content) ? event.data.content : []
+    const text = content
+      .filter((block) => block && typeof block === 'object' && (block as { type?: string }).type === 'text')
+      .map((block) => String((block as { text?: unknown }).text ?? ''))
+      .join('\n')
+      .trim()
+    if (text) return text.slice(0, 8192)
+  }
+  return ''
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
@@ -150,11 +215,14 @@ export class ChatService {
   private now: () => number
   private id: IdFactory
 
-  constructor(options: { db: DatabaseSync; runtime: ChatRuntime; now?: () => number; idFactory?: IdFactory }) {
+  private intake?: WorkIntake
+
+  constructor(options: { db: DatabaseSync; runtime: ChatRuntime; now?: () => number; idFactory?: IdFactory; intake?: WorkIntake }) {
     this.db = options.db
     this.runtime = options.runtime
     this.now = options.now ?? (() => Date.now())
     this.id = options.idFactory ?? createIdFactory(this.now)
+    this.intake = options.intake
   }
 
   get available(): boolean {
@@ -195,7 +263,7 @@ export class ChatService {
     return { ...bot, kind: 'member', targetId, title: bot.memberName }
   }
 
-  private bot(memberId: string): { memberId: string; memberName: string; memberVersion: number; agentPreset: string; model: string | null } {
+  private bot(memberId: string): { memberId: string; memberName: string; memberVersion: number; agentPreset: string; model: string | null; prompt: string } {
     const member = this.db
       .prepare('SELECT id, name, status, kind, current_version FROM member WHERE id = ?')
       .get(memberId) as { id: string; name: string; status: string; kind: string; current_version: number } | undefined
@@ -208,8 +276,8 @@ export class ChatService {
     const version = Number(member.current_version || 0)
     const config = version
       ? (this.db
-          .prepare('SELECT agent_preset, model FROM member_version WHERE member_id = ? AND version = ?')
-          .get(memberId, version) as { agent_preset: string | null; model: string | null } | undefined)
+          .prepare('SELECT agent_preset, model, prompt FROM member_version WHERE member_id = ? AND version = ?')
+          .get(memberId, version) as { agent_preset: string | null; model: string | null; prompt: string | null } | undefined)
       : undefined
     return {
       memberId,
@@ -217,6 +285,7 @@ export class ChatService {
       memberVersion: version,
       agentPreset: (config?.agent_preset || '').trim() || DEFAULT_BOT_PRESET,
       model: config?.model ?? null,
+      prompt: config?.prompt || '',
     }
   }
 
@@ -276,14 +345,15 @@ export class ChatService {
       existing.memberVersion === peer.memberVersion &&
       existing.agentPreset === peer.agentPreset &&
       (existing.model || null) === model
-    const context = input.kind === 'project'
+    const context = (input.kind === 'project'
       ? `你在 HAMS 项目《${peer.title}》（projectId=${input.targetId}）的群聊里，是这个项目的推进 bot。`
         + '你可以用 hams_list_project_work 查这个项目的工作项进展，用 hams_assign_task 把 ready 工作项指派给其他 bot；'
         + '关单与审批只能由人做。用中文简短回答。'
         + (projectMemoryBlock(this.db, input.targetId) ? `\n${projectMemoryBlock(this.db, input.targetId)}` : '')
       : `你在 HAMS 里作为《${peer.memberName}》与人类单聊，身份是成员 ${peer.memberId}。`
         + '涉及工作项时用 HAMS 工具读写事实，不要编造状态；关单与审批只能由人做。用中文简短回答。'
-        + (memberMemoryBlock(this.db, peer.memberId) ? `\n${memberMemoryBlock(this.db, peer.memberId)}` : '')
+        + (memberMemoryBlock(this.db, peer.memberId) ? `\n${memberMemoryBlock(this.db, peer.memberId)}` : ''))
+      + promptContextBlock(peer.prompt, peer.agentPreset)
     const { sessionId } = await this.runtime.ensure({
       sessionId: sameConfig ? existing.sessionId : undefined,
       key: `chat:${input.kind}:${input.targetId}`,
@@ -291,6 +361,7 @@ export class ChatService {
       memberName: peer.memberName,
       memberVersion: peer.memberVersion,
       agentPreset: peer.agentPreset,
+      prompt: peer.prompt,
       model,
       title: input.kind === 'project' ? `项目群聊 · ${peer.title}` : `单聊 · ${peer.memberName}`,
       context,
@@ -302,10 +373,68 @@ export class ChatService {
       memberVersion: peer.memberVersion,
       agentPreset: peer.agentPreset,
       model,
+      prompt: peer.prompt,
       at,
     }
     if (!sameConfig || !existing) this.savePointer(input.kind, input.targetId, pointer)
     return { ...peer, model, sessionId, createdAt: existing?.at ?? at, updatedAt: at }
+  }
+
+  /** 单聊时反查这个 bot 唯一能代表的项目：优先它推进的项目，其次唯一参与的项目。 */
+  private projectForBot(memberId: string): string | null {
+    const coordinated = this.db
+      .prepare("SELECT id FROM project WHERE coordinator_id = ? AND status = 'active' AND deleted_at IS NULL ORDER BY updated_at DESC")
+      .all(memberId) as { id: string }[]
+    if (coordinated.length === 1) return coordinated[0].id
+    if (coordinated.length > 1) return null
+    const joined = this.db
+      .prepare(
+        `SELECT p.id FROM project_participant pp JOIN project p ON p.id = pp.project_id
+          WHERE pp.member_id = ? AND pp.removed_at IS NULL AND p.status = 'active' AND p.deleted_at IS NULL
+          ORDER BY pp.added_at DESC`,
+      )
+      .all(memberId) as { id: string }[]
+    return joined.length === 1 ? joined[0].id : null
+  }
+
+  private intakeSystemText(outcome: IntakeOutcome): string {
+    if (outcome.kind === 'create') return `已把这条消息登记为工作项《${outcome.title}》（${outcome.workItemId}）`
+    const label = { paused: '暂停', active: '继续', cancelled: '取消' }[outcome.status] || outcome.status
+    return `已把工作项《${outcome.title}》状态改为「${label}」`
+  }
+
+  private intakeNote(outcome: IntakeOutcome | null): string {
+    if (!outcome) return ''
+    if (outcome.kind === 'create') {
+      return `【系统】人类这句话已经登记为工作项 ${outcome.workItemId}《${outcome.title}》${outcome.created ? '' : '（此前已存在，直接复用）'}；直接用它推进或派活，不要重复建单。\n\n`
+    }
+    return `【系统】人类这句话已经更新工作项 ${outcome.workItemId}《${outcome.title}》的状态${outcome.changed ? '' : '（此前已是该状态）'}；不要再重复处理。\n\n`
+  }
+
+  /** 人发出的一条消息是否要建单/改状态；返回要附加给 bot 的提示。 */
+  private async intakeNoteFor(ctx: CommandContext, thread: ChatThreadView, text: string): Promise<string> {
+    if (!this.intake) return ''
+    const projectId = thread.kind === 'project' ? thread.targetId : this.projectForBot(thread.memberId)
+    if (!projectId) return ''
+    let recent = ''
+    try {
+      const view = await this.runtime.read(thread.sessionId)
+      recent = view.messages
+        .slice(-4)
+        .map((message) => `${message.role}: ${message.text.slice(0, 200)}`)
+        .join('\n')
+    } catch {
+      recent = ''
+    }
+    const result = await this.intake.registerFromMessage({
+      projectId,
+      senderId: ctx.principalId,
+      text,
+      messageId: `msg-${this.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      mentionedMemberId: null,
+      recent,
+    })
+    return this.intakeNote(result)
   }
 
   async send(ctx: CommandContext, input: { kind: ChatKind; targetId: string; text: string }): Promise<{ sessionId: string; accepted: true }> {
@@ -315,7 +444,11 @@ export class ChatService {
     const thread = await this.open(ctx, { kind: input.kind, targetId: input.targetId })
     // 单聊里把 bot 从项目同步过来的能力记忆带进每一轮，不依赖会话首次创建的上下文。
     const memory = thread.kind === 'member' ? memberMemoryBlock(this.db, thread.memberId) : ''
-    await this.runtime.send(thread.sessionId, memory ? `${memory}\n\n${text}` : text)
+    // 单聊/项目会话同样自动识别新活；识别结果作为系统提示附在这条消息前面。
+    let intakeNote = ''
+    try { intakeNote = await this.intakeNoteFor(ctx, thread, text) } catch { intakeNote = '' }
+    const body = memory ? `${memory}\n\n${text}` : text
+    await this.runtime.send(thread.sessionId, intakeNote ? `${intakeNote}${body}` : body)
     return { sessionId: thread.sessionId, accepted: true }
   }
 
@@ -340,6 +473,7 @@ export class ChatService {
         memberVersion: pointer.memberVersion,
         agentPreset: pointer.agentPreset,
         model: pointer.model,
+        prompt: pointer.prompt || '',
       }
     }
     const { messages, running, error } = await this.runtime.read(pointer.sessionId)
@@ -429,7 +563,7 @@ export class ChatService {
 
   private async ensureGroupSession(
     project: { id: string; name: string },
-    member: { memberId: string; memberName: string; memberVersion: number; agentPreset: string; model: string | null },
+    member: { memberId: string; memberName: string; memberVersion: number; agentPreset: string; model: string | null; prompt: string },
     isCoordinator: boolean,
     context: string,
   ): Promise<{ sessionId: string; running: boolean }> {
@@ -459,9 +593,10 @@ export class ChatService {
       memberName: member.memberName,
       memberVersion: member.memberVersion,
       agentPreset: member.agentPreset,
+      prompt: member.prompt,
       model,
       title: `项目群 · ${project.name} · ${member.memberName}`,
-      context,
+      context: context + promptContextBlock(member.prompt, member.agentPreset),
     })
     const at = this.now()
     const pointer: ThreadPointer = {
@@ -470,6 +605,7 @@ export class ChatService {
       memberVersion: member.memberVersion,
       agentPreset: member.agentPreset,
       model,
+      prompt: member.prompt,
       at,
     }
     this.savePointerAt(key, pointer)
@@ -494,7 +630,9 @@ export class ChatService {
       )
       .all(projectId) as Array<{ member_id: string; kind: 'member' | 'temp'; brief: string; added_at: number; name: string; status: string }>
     for (const row of members) {
-      rows.push({ memberId: row.member_id, name: row.name, kind: row.kind, status: row.status, brief: row.brief, addedAt: row.added_at })
+      // 子代理由 session 事件自动登记，brief 以「子代理」开头；单独一种团队角色，不混进手动建的临时 bot。
+      const kind: TeamKind = row.kind === 'temp' && row.brief.startsWith('子代理') ? 'subagent' : row.kind
+      rows.push({ memberId: row.member_id, name: row.name, kind, status: row.status, brief: row.brief, addedAt: row.added_at })
     }
     return rows
   }
@@ -502,7 +640,8 @@ export class ChatService {
   private rosterText(projectId: string): string {
     const project = this.projectRow(projectId)
     const rows = this.teamRows(projectId)
-    const lines = rows.map((row) => `- ${row.name}（${row.kind === 'coordinator' ? '推进 bot' : row.kind === 'temp' ? '临时 bot' : '成员'}，id=${row.memberId}）`)
+    const kindLabel = (kind: TeamKind) => kind === 'coordinator' ? '推进 bot' : kind === 'subagent' ? '子代理' : kind === 'temp' ? '临时 bot' : '成员'
+    const lines = rows.map((row) => `- ${row.name}（${kindLabel(row.kind)}，id=${row.memberId}）`)
     return `【项目群 ${project.name}】团队成员：\n${lines.join('\n')}`
   }
 
@@ -588,29 +727,236 @@ export class ChatService {
     }
   }
 
+  /** 最近一次扫描子代理的时间；团队页轮询时别每次都翻全部会话。 */
+  private lastSubagentScan = 0
+
+  /**
+   * DSH 的 subagent 是独立会话（header.origin='subagent'、parentSession=父会话），
+   * 不是 HAMS 成员；团队页要看得见，就得把它登记成本项目的一条临时成员。
+   * 同一个子会话只登记一次；子代理结束也不删，保留可追溯。
+   */
+  registerSubagent(input: { childSessionId: string; parentSessionId: string; label?: string; prompt?: string }): { memberId: string } | null {
+    const childSessionId = String(input.childSessionId || '').trim()
+    const parentSessionId = String(input.parentSessionId || '').trim()
+    if (!childSessionId || !parentSessionId) return null
+    const mapped = this.db.prepare('SELECT value FROM hams_meta WHERE key = ?').get(`subagent:session:${childSessionId}`) as { value: string } | undefined
+    if (mapped) {
+      try {
+        const parsed = JSON.parse(mapped.value) as { memberId?: unknown }
+        if (typeof parsed.memberId === 'string' && parsed.memberId) return { memberId: parsed.memberId }
+      } catch {
+        // 旧值坏了就重新登记，下一段会覆盖
+      }
+    }
+    const project = this.projectRefOfSession(parentSessionId)
+    if (!project) return null
+    const label = String(input.label || '').trim().slice(0, 40)
+    // 子代理自己的任务提示词：能读到就存进版本，团队「查看」里可读可改（只作为 HAMS 记录）。
+    const prompt = String(input.prompt || '').trim().slice(0, 8192)
+    let name = label || `子代理 ${childSessionId.slice(0, 6)}`
+    const clash = this.db.prepare('SELECT 1 AS hit FROM member WHERE name = ?').get(name) as { hit: number } | undefined
+    if (clash) name = `${name.slice(0, 34)} · ${childSessionId.slice(0, 4)}`
+    const at = this.now()
+    const memberId = this.id()
+    this.db
+      .prepare(
+        `INSERT INTO member (id, kind, name, domain, responsibility, role, status, current_version,
+                             owner_human_id, scope_project_id, created_at, updated_at)
+         VALUES (?, 'bot', ?, NULL, ?, 'observer', 'active', 1, ?, ?, ?, ?)`,
+      )
+      .run(memberId, name, label, project.ownerHumanId, project.id, at, at)
+    const digest = createHash('sha256').update(`subagent\n${childSessionId}\n${label}`).digest('hex').slice(0, 16)
+    this.db
+      .prepare(
+        `INSERT INTO member_version
+           (id, member_id, version, agent_preset, model, memory_scope_json, prompt, prompt_digest,
+            change_class, published_by, published_at)
+         VALUES (?, ?, 1, ?, NULL, '{}', ?, ?, 'major', ?, ?)`,
+      )
+      .run(this.id(), memberId, 'hams-bot', prompt, digest, project.ownerHumanId, at)
+    // 参与关系用 temp（schema 只有 member/temp），brief 前缀让团队页把它识别成「子代理」。
+    this.db
+      .prepare(
+        `INSERT INTO project_participant (project_id, member_id, kind, brief, added_by, added_at)
+         VALUES (?, ?, 'temp', ?, ?, ?)`,
+      )
+      .run(project.id, memberId, `子代理 · ${label || childSessionId.slice(0, 6)}`, project.ownerHumanId, at)
+    this.db.prepare('INSERT OR REPLACE INTO hams_meta (key, value) VALUES (?, ?)').run(
+      `subagent:session:${childSessionId}`,
+      JSON.stringify({ memberId, projectId: project.id }),
+    )
+    this.db.prepare('INSERT OR REPLACE INTO hams_meta (key, value) VALUES (?, ?)').run(
+      `member:${memberId}:subagent`,
+      childSessionId,
+    )
+    return { memberId }
+  }
+
+  /** 由父会话反查项目：群会话索引 → 工作项线程 → 单聊后面挂的推进/参与项目。 */
+  /** 和公开的 `projectOfSession`（只认群索引）区分：这里要把父会话反查成项目，含工作项线程与单聊。 */
+  private projectRefOfSession(sessionId: string): { id: string; ownerHumanId: string } | null {
+    if (!sessionId) return null
+    const groupProjectId = this.projectOfSession(sessionId)
+    if (groupProjectId) {
+      const row = this.db.prepare('SELECT id, owner_human_id FROM project WHERE id = ? AND deleted_at IS NULL').get(groupProjectId) as
+        | { id: string; owner_human_id: string }
+        | undefined
+      if (row) return { id: row.id, ownerHumanId: row.owner_human_id }
+    }
+    const thread = this.db
+      .prepare(
+        `SELECT w.project_id AS projectId FROM work_item_thread t
+           JOIN work_item w ON w.id = t.work_item_id
+          WHERE t.session_id = ? AND w.project_id IS NOT NULL
+          ORDER BY t.started_at DESC LIMIT 1`,
+      )
+      .get(sessionId) as { projectId: string } | undefined
+    if (thread) {
+      const row = this.db.prepare('SELECT id, owner_human_id FROM project WHERE id = ? AND deleted_at IS NULL').get(thread.projectId) as
+        | { id: string; owner_human_id: string }
+        | undefined
+      if (row) return { id: row.id, ownerHumanId: row.owner_human_id }
+    }
+    const chatMemberId = this.memberOfSession(sessionId)
+    if (chatMemberId) {
+      const coordinator = this.db
+        .prepare('SELECT id, owner_human_id FROM project WHERE coordinator_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT 1')
+        .get(chatMemberId) as { id: string; owner_human_id: string } | undefined
+      if (coordinator) return { id: coordinator.id, ownerHumanId: coordinator.owner_human_id }
+      const participant = this.db
+        .prepare(
+          `SELECT p.id, p.owner_human_id FROM project_participant pp JOIN project p ON p.id = pp.project_id
+            WHERE pp.member_id = ? AND pp.removed_at IS NULL AND p.deleted_at IS NULL
+            ORDER BY pp.added_at DESC LIMIT 1`,
+        )
+        .get(chatMemberId) as { id: string; owner_human_id: string } | undefined
+      if (participant) return { id: participant.id, ownerHumanId: participant.owner_human_id }
+    }
+    return null
+  }
+
+  private subagentSessionOf(memberId: string): string | null {
+    const row = this.db.prepare('SELECT value FROM hams_meta WHERE key = ?').get(`member:${memberId}:subagent`) as { value: string } | undefined
+    return row?.value || null
+  }
+
+  /** 给早期登记（prompt 为空）的子代理补任务文本：新增一版配置，不改旧版本。 */
+  private backfillSubagentPrompt(memberId: string, prompt: string): void {
+    const text = String(prompt || '').trim().slice(0, 8192)
+    if (!text) return
+    const member = this.db.prepare('SELECT id, current_version, owner_human_id, status FROM member WHERE id = ?').get(memberId) as
+      | { id: string; current_version: number; owner_human_id: string; status: string }
+      | undefined
+    if (!member || member.status === 'retired') return
+    const current = this.db.prepare('SELECT * FROM member_version WHERE member_id = ? AND version = ?').get(memberId, member.current_version) as
+      | Record<string, any>
+      | undefined
+    if (!current || String(current.prompt || '').trim()) return
+    const at = this.now()
+    const version = Number(member.current_version || 0) + 1
+    const digest = createHash('sha256').update(`${memberId}\n${text}`).digest('hex').slice(0, 16)
+    this.db
+      .prepare(
+        `INSERT INTO member_version
+           (id, member_id, version, agent_preset, model, memory_scope_json, prompt, prompt_digest,
+            change_class, published_by, published_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'minor', ?, ?)`,
+      )
+      .run(this.id(), memberId, version, current.agent_preset ?? 'hams-bot', current.model ?? null, current.memory_scope_json ?? '{}', text, digest, member.owner_human_id, at)
+    this.db.prepare('INSERT INTO member_version_skill (member_version_id, skill_id, skill_version_id) SELECT ?, skill_id, skill_version_id FROM member_version_skill WHERE member_version_id = ?').run(
+      this.id(),
+      current.id,
+    )
+    this.db.prepare('UPDATE member SET current_version = ?, updated_at = ? WHERE id = ?').run(version, at, memberId)
+  }
+
+  /** 轻量补登记：扫最近会话里 origin=subagent 且有 HAMS 父会话的，10 秒最多一次。 */
+  private async discoverSubagents(): Promise<void> {
+    if (!this.runtime.listSessions || !this.runtime.readSessionEvents) return
+    const now = this.now()
+    if (now - this.lastSubagentScan < 10_000) return
+    this.lastSubagentScan = now
+    const sessions = await this.runtime.listSessions()
+    const cutoff = now - 7 * 86_400_000
+    let budget = 40
+    for (const session of sessions) {
+      if (!session || session.origin !== 'subagent' || !session.parentSession) continue
+      if (!session.id || (session.createdAt && session.createdAt < cutoff)) continue
+      const known = this.db.prepare('SELECT value FROM hams_meta WHERE key = ?').get(`subagent:session:${session.id}`) as { value: string } | undefined
+      let knownMemberId = ''
+      if (known) {
+        try { knownMemberId = String((JSON.parse(known.value) as { memberId?: unknown }).memberId || '') } catch { knownMemberId = '' }
+      }
+      if (!knownMemberId) {
+        // 先在 HAMS 索引里认父会话，认不出就别读子会话全文（历史里可能有几百条无关记录）。
+        if (!this.projectRefOfSession(session.parentSession)) continue
+        if (budget <= 0) break
+        budget -= 1
+      } else {
+        // 早一版登记的子代理 prompt 是空的：只给这些存量补读一次，补完就不再读。
+        const empty = this.db
+          .prepare('SELECT 1 AS hit FROM member m JOIN member_version v ON v.member_id = m.id AND v.version = m.current_version WHERE m.id = ? AND v.prompt = \'\'')
+          .get(knownMemberId) as { hit: number } | undefined
+        if (!empty) continue
+      }
+      let label = ''
+      let prompt = ''
+      try {
+        const events = await this.runtime.readSessionEvents(session.id)
+        const descriptor = events.find((event) => event && typeof event === 'object' && (event as { type?: string }).type === 'subagent/descriptor') as
+          | { data?: { label?: unknown } }
+          | undefined
+        label = typeof descriptor?.data?.label === 'string' ? descriptor.data.label : ''
+        prompt = subagentTaskPrompt(events, session.createdAt || 0)
+      } catch {
+        label = ''
+      }
+      if (knownMemberId) this.backfillSubagentPrompt(knownMemberId, prompt)
+      else this.registerSubagent({ childSessionId: session.id, parentSessionId: session.parentSession, label, prompt })
+    }
+  }
+
   async team(ctx: CommandContext, input: { projectId: string }): Promise<{ projectId: string; title: string; coordinator: TeamMemberView | null; members: TeamMemberView[] }> {
     resolvePrincipal(this.db, ctx.principalId, this.now())
     const project = this.projectRow(input.projectId)
+    // 先补登记最近的子代理：即使宿主没触发事件（老实例/重启前就在跑），打开团队页也能看到。
+    try { await this.discoverSubagents() } catch { /* 发现失败不能影响团队页 */ }
     const rows = this.teamRows(input.projectId)
     const views: TeamMemberView[] = []
     for (const row of rows) {
       const isCoordinator = row.kind === 'coordinator'
       const pointer = this.pointerAt(this.groupKey(input.projectId, row.memberId, isCoordinator))
+      // 状态 = 是否还在推进独立对话：群会话 / 单聊 / 子代理会话任一在跑，或还有 running 的执行。
+      const childSessionId = row.kind === 'subagent' ? this.subagentSessionOf(row.memberId) : null
+      const dmSessionId = this.pointer('member', row.memberId)?.sessionId ?? null
+      const watchedSessionIds = [...new Set([pointer?.sessionId, dmSessionId, childSessionId].filter((id): id is string => Boolean(id)))]
       let running = false
-      if (pointer && this.runtime.available && this.runtime.status) {
-        try {
-          running = (await this.runtime.status(pointer.sessionId)).running
-        } catch {
-          running = false
+      if (watchedSessionIds.length && this.runtime.available) {
+        for (const sessionId of watchedSessionIds) {
+          try {
+            running = this.runtime.liveStatus
+              ? this.runtime.liveStatus(sessionId).running
+              : this.runtime.status
+                ? (await this.runtime.status(sessionId)).running
+                : false
+          } catch {
+            running = false
+          }
+          if (running) break
         }
       }
+      if (!running) {
+        const activeRun = this.db.prepare("SELECT 1 AS hit FROM task_run WHERE member_id = ? AND status = 'running' LIMIT 1").get(row.memberId) as { hit: number } | undefined
+        running = Boolean(activeRun)
+      }
+      const watchedSessionId = watchedSessionIds[0] ?? null
       views.push({
         memberId: row.memberId,
         name: row.name,
         kind: row.kind,
         status: row.status,
         brief: row.brief,
-        sessionId: pointer?.sessionId ?? null,
+        sessionId: watchedSessionId,
         running,
       })
     }
@@ -698,10 +1044,10 @@ export class ChatService {
     const digest = createHash('sha256').update(`${name}\n${brief}`).digest('hex').slice(0, 16)
     this.db
       .prepare(
-        `INSERT INTO member_version (id, member_id, version, agent_preset, model, memory_scope_json, prompt_digest, change_class, published_by, published_at)
-         VALUES (?, ?, 1, 'hams-bot', NULL, '{}', ?, 'major', ?, ?)`,
+        `INSERT INTO member_version (id, member_id, version, agent_preset, model, memory_scope_json, prompt, prompt_digest, change_class, published_by, published_at)
+         VALUES (?, ?, 1, 'hams-bot', NULL, '{}', ?, ?, 'major', ?, ?)`,
       )
-      .run(this.id(), memberId, digest, principal.memberId, at)
+      .run(this.id(), memberId, brief, digest, principal.memberId, at)
     const grant = this.db.prepare('INSERT OR IGNORE INTO member_permission (member_id, capability, scope, granted_by, granted_at) VALUES (?, ?, ?, ?, ?)')
     for (const capability of ['work_item.execute', 'work_item.claim', 'evidence.append']) {
       grant.run(memberId, capability, `project:${project.id}`, principal.memberId, at)
@@ -814,9 +1160,34 @@ export class ChatService {
       authorName: humanName,
       text,
     })
+    // 服务端先识别：这句话是不是一件新活？是就自动登记，不依赖模型是否调工具。
+    let intake: IntakeOutcome | null = null
+    try {
+      intake = await (this.intake?.registerFromMessage({
+        projectId: input.projectId,
+        senderId: ctx.principalId,
+        text,
+        messageId,
+        mentionedMemberId: mentioned.length ? first.memberId : null,
+        recent: this.recentTranscript(input.projectId, 4),
+      }) ?? null)
+    } catch {
+      intake = null
+    }
+    const intakeNote = this.intakeNote(intake)
+    if (intake) {
+      this.appendGroupMessage({
+        projectId: input.projectId,
+        authorKind: 'system',
+        authorId: 'system',
+        authorName: '系统',
+        text: this.intakeSystemText(intake),
+        kind: 'system',
+      })
+    }
     const sessionIds: string[] = []
     for (const row of targets) {
-      sessionIds.push(await this.deliverHumanMessage(project, row, text, humanName, mentioned.length > 0))
+      sessionIds.push(await this.deliverHumanMessage(project, row, text, humanName, mentioned.length > 0, intakeNote))
     }
     return { messageId, sessionId: sessionIds[0], mentions: mentioned.map((row) => row.memberId) }
   }
@@ -936,6 +1307,7 @@ export class ChatService {
     text: string,
     humanName: string,
     mentioned: boolean,
+    intakeNote = '',
   ): Promise<string> {
     if (row.status !== 'active') {
       throw new HamsError('STATE_INVALID', `${row.name} 当前不在岗，接不了这条指令`, { nextStep: '在智能体详情里恢复它在岗，或换一个 bot' })
@@ -949,12 +1321,13 @@ export class ChatService {
     const prefix = mentioned ? `[人类 ${humanName} @你]` : `[人类 ${humanName}]`
     const instruction = isCoordinator
       ? '（你是推进 bot。派活必须用 hams_group_send，并在 text 开头写「@成员名」，让群里看得见你点了谁；' +
+        '系统已登记工作项时直接用它的 id 派给成员；系统没登记、你判断是新活时才用 hams_create_work_item 补建；' +
         '自己的判断可以直接回答，不要@不存在的人；关单与审批只能由人做。）'
       : '（你被人类点名了。直接回答这条指令；需要别人继续用 hams_group_send；关单与审批只能由人做，不要编造没记录过的事。）'
     const memory = projectMemoryBlock(this.db, project.id)
     await this.runtime.send(
       sessionId,
-      `${roster}\n\n${memory ? `${memory}\n\n` : ''}【群聊最近记录】\n${transcript}\n\n${prefix} ${text}\n\n${instruction}`,
+      `${roster}\n\n${memory ? `${memory}\n\n` : ''}【群聊最近记录】\n${transcript}\n\n${intakeNote}${prefix} ${text}\n\n${instruction}`,
     )
     return sessionId
   }
@@ -963,8 +1336,10 @@ export class ChatService {
     return (
       `你在 HAMS 项目《${project.name}》（projectId=${project.id}）的群聊里，是这个项目的推进 bot。\n` +
       `${roster}\n` +
-      '你可以：看项目工作项（hams_list_project_work）、指派任务（hams_assign_task）、@ 群成员（hams_group_send 带 memberId）、' +
+      '你可以：看项目工作项（hams_list_project_work）、在本项目建工作项（hams_create_work_item，projectId 用上面的）、' +
+      '指派任务（hams_assign_task）、@ 群成员（hams_group_send 带 memberId）、' +
       '建临时 bot（hams_group_spawn_bot，只属于这个项目群）、记项目记忆（hams_remember）。关单与审批只能由人做。用中文简短回答。\n' +
+      '人类的新活会由系统自动登记成工作项，消息里会给出工作项 id；优先用那条工作项派活。只有系统没登记、而你认为确实还缺一条时，才用 hams_create_work_item 补建（同标题自动去重）。\n' +
       '遇到决定、偏好、教训、口径或 bot 能力经验，用 hams_remember 记下来；能力类会同步给对应 bot。\n' +
       (projectMemoryBlock(this.db, project.id) ? `${projectMemoryBlock(this.db, project.id)}\n` : '') +
       '硬规则：派活给谁，就在群聊正文里写出「@名字」；hams_group_send 会自动补上开头的 @名字，' +
@@ -976,7 +1351,7 @@ export class ChatService {
     return (
       `你在 HAMS 项目《${project.name}》的群聊里，是群里的一名 bot 成员。\n${roster}\n` +
       '被 @ 时你会收到带上下文的指令；回复直接说话即可，会被合并进群聊记录。需要其他成员时用 hams_group_send，' +
-      '正文同样要写出「@名字」。不要替推进 bot 派活，也不要批准关单。' +
+      '正文同样要写出「@名字」。系统会自动登记新活；需要额外建任务时用 hams_create_work_item（有权限时）或请推进 bot 建单；不要替推进 bot 派活，也不要批准关单。' +
       (projectMemoryBlock(this.db, project.id) ? `\n${projectMemoryBlock(this.db, project.id)}` : '')
     )
   }

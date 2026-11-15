@@ -8,6 +8,7 @@ import type { HamsService } from '../service/hams.ts'
 import type { CommandContext, CommandReceipt, RunRow, ThreadRow, WorkItemRow } from '../service/types.ts'
 import { CAPABILITY, requireCapability, requireHuman, resolvePrincipal } from '../service/permissions.ts'
 import { TOOL_NAMES } from '../service/tools.ts'
+import { HAMS_BOT_PRESET } from './bot-preset.ts'
 
 export interface HostAgent {
   session: { id: string }
@@ -20,7 +21,7 @@ export interface HostAgents {
   create(options: { sessionId: string; meta: Record<string, unknown>; agentOptions: Record<string, unknown>; setup?: unknown }): Promise<HostAgentHandle>
   resume(options: { resumeSessionId: string; agentOptions: Record<string, unknown>; setup?: unknown }): Promise<HostAgentHandle>
 }
-export interface BotConfig { memberId: string; version: number; agentPreset: string; model: string | null }
+export interface BotConfig { memberId: string; memberName: string; version: number; agentPreset: string; model: string | null; prompt: string }
 export interface SessionAdapterOptions {
   db: DatabaseSync
   service: HamsService
@@ -56,6 +57,9 @@ export function buildRunFacts(db: DatabaseSync, runId: string, now = Date.now(),
   if (!run) throw new HamsError('STATE_INVALID', `运行不存在：${runId}`)
   const item = db.prepare('SELECT * FROM work_item WHERE id=?').get(run.work_item_id) as WorkItemRow
   const template = item.template_version_id ? db.prepare('SELECT * FROM work_template_version WHERE id=?').get(item.template_version_id) : null
+  // 配了别的宿主 preset 时人设不由 hams-bot 提供，把提示词塞进事实快照，保证这一轮看得到。
+  const version = db.prepare('SELECT prompt, agent_preset FROM member_version WHERE member_id=? AND version=?').get(run.member_id, run.member_version) as { prompt: string | null; agent_preset: string | null } | undefined
+  const botPrompt = version && version.agent_preset && version.agent_preset !== HAMS_BOT_PRESET ? String(version.prompt || '').trim() : ''
   const date = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(now))
   const utc = new Date(`${date}T00:00:00Z`)
   utc.setUTCDate(utc.getUTCDate() - ((utc.getUTCDay() + 6) % 7))
@@ -66,7 +70,7 @@ export function buildRunFacts(db: DatabaseSync, runId: string, now = Date.now(),
   return {
     stateAndEpoch: { workItemId: item.id, status: item.status, revision: item.revision, executionEpoch: item.execution_epoch, fence: run.fence, runtimeEpoch: run.runtime_epoch },
     evidenceAndHashes: { evidenceSetHash: item.evidence_set_hash, evidence: db.prepare("SELECT id,kind,ref,content_hash,observed_at,source FROM evidence WHERE work_item_id=? AND status='active' ORDER BY id").all(item.id) },
-    taskAndCriteria: { runId, trigger: run.trigger, checkId: run.check_id, title: item.title, memberVersion: run.member_version, templateVersion: template ?? null },
+    taskAndCriteria: { runId, trigger: run.trigger, checkId: run.check_id, title: item.title, memberVersion: run.member_version, templateVersion: template ?? null, ...(botPrompt ? { botPrompt } : {}) },
     approvalsAndBlockers: { blockedReason: item.blocked_reason, approvals: db.prepare("SELECT id,status,reason_text,expires_at FROM approval WHERE subject_kind='work_item_close' AND subject_id=? AND status='pending' ORDER BY id").all(item.id) },
     budgetAndCapabilities: {
       budgets,
@@ -100,19 +104,34 @@ export class HamsSessionAdapter {
     return this.options.db.prepare("SELECT * FROM work_item_thread WHERE work_item_id=? AND status IN ('active','pending_rotate') ORDER BY generation DESC LIMIT 1").get(workItemId) as ThreadRow | undefined
   }
   private config(memberId: string, version?: number): BotConfig {
-    const row = this.options.db.prepare(`SELECT v.*,m.status,m.kind FROM member_version v JOIN member m ON m.id=v.member_id WHERE v.member_id=? AND v.version=${version === undefined ? 'm.current_version' : '?'}`).get(...(version === undefined ? [memberId] : [memberId, version])) as { version: number; agent_preset: string; model: string | null; kind: string; status: string } | undefined
+    const row = this.options.db.prepare(`SELECT v.*,m.status,m.kind,m.name FROM member_version v JOIN member m ON m.id=v.member_id WHERE v.member_id=? AND v.version=${version === undefined ? 'm.current_version' : '?'}`).get(...(version === undefined ? [memberId] : [memberId, version])) as { version: number; agent_preset: string; model: string | null; prompt: string | null; name: string; kind: string; status: string } | undefined
     if (!row || row.kind !== 'bot' || row.status !== 'active') throw new HamsError('HOST_CAPABILITY_MISSING', 'bot 没有有效且已发布的宿主 preset')
-    return { memberId, version: row.version, agentPreset: row.agent_preset || this.options.defaultPreset || '', model: row.model }
+    return { memberId, memberName: row.name, version: row.version, agentPreset: row.agent_preset || this.options.defaultPreset || '', model: row.model, prompt: row.prompt || '' }
   }
   private needsRotation(thread: ThreadRow): boolean {
     return thread.status === 'pending_rotate' || Boolean(this.options.db.prepare("SELECT 1 FROM member_version WHERE member_id=? AND version>? AND change_class='major'").get(thread.member_id, thread.member_version))
   }
+  /** 宿主调用加超时：预设挂载/建会话卡住时不能让派发器永远停在 dispatching=true。 */
+  private async withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new HamsError('HOST_CAPABILITY_MISSING', `${label}超时（${ms}ms）`, { nextStep: '检查宿主 agents 服务与 bot preset 是否可用；必要时重启 DSH' })), ms)
+        }),
+      ])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
   private async open(config: BotConfig, existing?: string, cwdKey?: string): Promise<HostAgentHandle> {
     if (existing && this.handles.has(existing)) return this.handles.get(existing)!
     const id = existing ?? (this.options.sessionId ?? (() => `session-${randomUUID()}`))()
     if (!id.trim() || this.handles.has(id)) throw new HamsError('STATE_INVALID', '宿主会话 id 重复或为空')
     const pending = (async () => {
-      const composition = await this.options.compose(config)
+      const composition = await this.withTimeout(this.options.compose(config), 20_000, '组合 bot 预设')
       const { agentPreset: composedPreset, ...rest } = composition
       const presetId = composedPreset ?? config.agentPreset
       // 一个 bot 可能同时是多个工作项的负责人：工作项各占一个子目录，不和别的任务混在一起。
@@ -120,9 +139,17 @@ export class HamsSessionAdapter {
       const base = path.resolve(this.options.dataDir, 'bots') + path.sep
       if (!cwd.startsWith(base)) throw new HamsError('POLICY_DENIED', 'bot 工作目录越界')
       await mkdir(cwd, { recursive: true })
-      const handle = existing
-        ? await this.options.agents.resume({ resumeSessionId: id, ...rest })
-        : await this.options.agents.create({ sessionId: id, meta: { cwd, ...(presetId ? { agentPreset: presetId } : {}) }, ...rest })
+      const opening = existing
+        ? this.options.agents.resume({ resumeSessionId: id, ...rest })
+        : this.options.agents.create({ sessionId: id, meta: { cwd, ...(presetId ? { agentPreset: presetId } : {}) }, ...rest })
+      let handle: HostAgentHandle
+      try {
+        handle = await this.withTimeout(opening, 45_000, '宿主创建/恢复会话')
+      } catch (error) {
+        // 超时后宿主仍可能把会话建出来；一旦回来就释放，避免留下不可见的活句柄。
+        void opening.then((late) => late.dispose()).catch(() => {})
+        throw error
+      }
       if (handle.agent.session.id !== id) { await handle.dispose(); throw new HamsError('HOST_CAPABILITY_MISSING', '宿主返回的会话身份与请求不一致') }
       return handle
     })()

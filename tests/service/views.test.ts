@@ -65,6 +65,37 @@ test('v01 人工建单：默认负责人是自己，dedupe 未结唯一，bot/�
   h.close()
 })
 
+test('v01b 推进 bot 可直接给本项目建单；同标题自动去重，非推进 bot 仍被拒', () => {
+  const h = createHarness(test)
+  const created = h.service.createWorkItem(h.ctx(IDS.coord, 'tool'), {
+    projectId: IDS.project,
+    domain: '安全',
+    category: '巡检',
+    title: '推进 bot 建的工作项',
+  })
+  assert.equal(created.status, 'applied')
+  const item = h.service.getWorkItem(h.ctx(IDS.owner), created.objectId as string)
+  assert.equal(item.project_id, IDS.project)
+  assert.equal(item.owner_human_id, IDS.owner, '负责人默认是项目负责人，不是 bot')
+  assert.equal(item.created_by, IDS.coord)
+
+  const duplicate = h.service.createWorkItem(h.ctx(IDS.coord, 'tool'), {
+    projectId: IDS.project,
+    domain: '安全',
+    category: '巡检',
+    title: '推进 bot 建的工作项',
+  })
+  assert.equal(duplicate.status, 'accepted')
+  assert.equal(duplicate.detail?.duplicate, true, '同一项目 + 标题自动去重')
+  assert.equal(duplicate.objectId, created.objectId)
+
+  assert.throws(
+    () => h.service.createWorkItem(h.ctx(IDS.bot, 'tool'), { projectId: IDS.project, domain: '安全', category: '巡检', title: '非推进 bot 建单' }),
+    (error: unknown) => error instanceof HamsError && error.code === 'POLICY_DENIED',
+  )
+  h.close()
+})
+
 test('v02 overview：待我把关、到期复查、执行中都聚合到负责人视角', () => {
   const h = createHarness(test)
   const review = driveToReview(h)

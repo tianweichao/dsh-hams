@@ -87,10 +87,13 @@ export interface MemberDetail extends MemberSummary {
     version: number
     model: string | null
     agent_preset: string | null
+    prompt: string
     change_class: string
     published_by: string
     published_at: number
   }[]
+  /** 非空 = 这是宿主 subagent 自动登记的子代理，没有 HAMS 托管配置。 */
+  subagent_session_id?: string | null
   login: {
     id: string
     login: string
@@ -247,7 +250,15 @@ export function listMembers(
 }
 
 export function getMember(db: DatabaseSync, now: number, memberId: string): MemberDetail {
-  const summary = listMembers(db, now, { limit: 200 }).find((item) => item.id === memberId)
+  // 临时 bot 的 scope_project_id 非空，默认列表故意不带它们；按它归属的项目查才拿得到。
+  const scope = db.prepare('SELECT scope_project_id FROM member WHERE id = ?').get(memberId) as
+    | { scope_project_id: string | null }
+    | undefined
+  if (!scope) throw stateInvalid(`成员不存在：${memberId}`)
+  const summary = listMembers(db, now, {
+    ...(scope.scope_project_id ? { projectId: scope.scope_project_id } : {}),
+    limit: 200,
+  }).find((item) => item.id === memberId)
   if (!summary) throw stateInvalid(`成员不存在：${memberId}`)
 
   const positionHistory = db
@@ -290,12 +301,15 @@ export function getMember(db: DatabaseSync, now: number, memberId: string): Memb
 
   const botVersions = db
     .prepare(
-      `SELECT id, version, model, agent_preset, change_class, published_by, published_at
+      `SELECT id, version, model, agent_preset, prompt, change_class, published_by, published_at
          FROM member_version WHERE member_id = ?
         ORDER BY version DESC LIMIT 10`,
     )
     .all(memberId) as MemberDetail['bot_versions']
 
+  const subagent = db.prepare('SELECT value FROM hams_meta WHERE key = ?').get(`member:${memberId}:subagent`) as
+    | { value: string }
+    | undefined
   const login = (db
     .prepare(
       `SELECT id, login, display_name, auth_source, is_admin, status, last_login_at
@@ -325,6 +339,7 @@ export function getMember(db: DatabaseSync, now: number, memberId: string): Memb
       created_at: Number(item.created_at),
     })),
     bot_versions: botVersions.map((item) => ({ ...item, version: Number(item.version), published_at: Number(item.published_at) })),
+    subagent_session_id: subagent?.value ?? null,
     login,
   }
 }
@@ -361,6 +376,8 @@ export interface CreateMemberInput {
   ownerHumanId?: string | null
   agentPreset?: string | null
   model?: string | null
+  /** bot 的人设提示词；空 = 用 HAMS 基础规则，创建时默认取职责。 */
+  prompt?: string | null
   capabilities?: string[]
   scope?: string | null
 }
@@ -374,6 +391,7 @@ export interface InsertedMember {
 
 /** bot 可以拿到的能力白名单：工具通道 + 业务动作，不含审批/发布/管理。 */
 export const BOT_GRANTABLE_CAPABILITIES = [
+  CAPABILITY.workItemCreate,
   CAPABILITY.workItemClaim,
   CAPABILITY.workItemExecute,
   CAPABILITY.workItemRequestClosure,
@@ -428,6 +446,8 @@ export function insertMember(
   if (!owner || owner.kind !== 'human') throw stateInvalid('bot 的责任人必须是存在的人')
   const agentPreset = optionalText(input.agentPreset, 'agent preset', 80)
   const model = optionalText(input.model, '模型', 120)
+  // 2026-11-15：职责不再只挂在成员表上——创建时默认把它作为提示词，随版本冻结。
+  const prompt = optionalText(input.prompt, '提示词', 8192) ?? responsibility
   const granted = [...new Set(Array.isArray(input.capabilities) ? input.capabilities : [])]
   for (const capability of granted) {
     if (!(BOT_GRANTABLE_CAPABILITIES as readonly string[]).includes(capability)) {
@@ -439,7 +459,7 @@ export function insertMember(
     throw stateInvalid('授权范围只能是 global / domain:<域> / project:<id>')
   }
   const promptDigest = createHash('sha256')
-    .update(JSON.stringify({ name, responsibility, agentPreset, model }))
+    .update(JSON.stringify({ name, responsibility, agentPreset, model, prompt }))
     .digest('hex')
 
   db.prepare(
@@ -449,10 +469,10 @@ export function insertMember(
   ).run(id, name, domain, responsibility, role, ownerId, now, now)
   db.prepare(
     `INSERT INTO member_version
-       (id, member_id, version, agent_preset, model, memory_scope_json, prompt_digest,
+       (id, member_id, version, agent_preset, model, memory_scope_json, prompt, prompt_digest,
         change_class, published_by, published_at)
-     VALUES (?, ?, 1, ?, ?, '{}', ?, 'major', ?, ?)`,
-  ).run(ids(), id, agentPreset, model, promptDigest, actorId, now)
+     VALUES (?, ?, 1, ?, ?, '{}', ?, ?, 'major', ?, ?)`,
+  ).run(ids(), id, agentPreset, model, prompt, promptDigest, actorId, now)
   const grant = db.prepare(
     `INSERT INTO member_permission (member_id, capability, scope, granted_by, granted_at)
      VALUES (?, ?, ?, ?, ?)`,

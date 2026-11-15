@@ -474,7 +474,7 @@ test('q13 智能体详情：指标与热力图同一区块、热力图格子变�
     id: 'b1', kind: 'bot', name: '知识整理 agent', domain: '知识', responsibility: '文档 ingest',
     role: 'executor', status: 'active', current_version: 2, positions: [], capabilities: [], work: { total: 4, open: 1 },
     runs: { total: 6, last_at: 0 }, activity: { from: days[0].day, to: days[83].day, timeZone: 'Asia/Shanghai', days },
-    config: { model: 'deepseek-chat', agent_preset: 'reader', memory_scope: {} },
+    config: { model: 'deepseek-chat', agent_preset: 'reader', memory_scope: {}, prompt: '' },
     bot_versions: [], position_history: [], permissions: [], recent_work: [], recent_runs: [], allowedActions: ['pause', 'publishConfig'],
   }
   const tree = renderScreen('MemberScreen', { members: [member], detail: member, positions: [], busy: false, formOpen: false, filter: 'all', onFilter: noop, onCreate: noop, onOpen: noop, onFormOpen: noop, onStatus: noop, onCommand: noop, initialTab: 'config' })
@@ -491,8 +491,8 @@ test('q13 智能体详情：指标与热力图同一区块、热力图格子变�
   const headerButtons = collect(header, (el) => el.type === 'button').map((el) => (el.children as string[]).join(''))
   assert.ok(headerButtons.includes('暂停分派'), '状态操作与名称同一行')
   // 配置默认只读：输入/文本域全部 disabled，页面上只有「编辑」一个入口
-  const configInputs = collect(tree, (el) => (el.type === 'input' || el.type === 'textarea') && ['职责', '模型', 'Agent preset', '记忆范围（JSON 对象）'].includes(String((el.props as Record<string, unknown>)?.['aria-label'])))
-  assert.equal(configInputs.length, 4)
+  const configInputs = collect(tree, (el) => (el.type === 'input' || el.type === 'textarea') && ['职责', '提示词（这个 bot 的人设；会注入它的会话）', '模型', 'Agent preset', '记忆范围（JSON 对象）'].includes(String((el.props as Record<string, unknown>)?.['aria-label'])))
+  assert.equal(configInputs.length, 5, '职责、提示词、模型、preset、记忆范围五项都可编辑')
   for (const input of configInputs) assert.equal((input.props as Record<string, unknown>).disabled, true, '未点编辑前配置项只读')
   const buttons = collect(tree, (el) => el.type === 'button').map((el) => (el.children as string[]).join(''))
   assert.ok(buttons.includes('编辑'), '配置卡要有「编辑」按钮')
@@ -608,10 +608,20 @@ test('q18 项目「团队」页签：推进 bot、成员、拉人入群、创建
     allowedActions: [], initialTab: 'team',
   })
   const text = textOf(tree)
-  for (const expected of ['团队', '推进 bot 指挥', '这个项目还没有推进 bot', '+ 成员', '成员', '职责', '操作']) {
+  for (const expected of ['团队', '推进 bot 指挥', '这个项目还没有推进 bot', '+ 成员', '成员', '职责', '状态', '操作']) {
     assert.ok(text.includes(expected), `团队页签应显示「${expected}」`)
   }
-  assert.ok(text.includes('临时 bot 只属于这个项目'), '要说明临时 bot 的归属')
+  assert.ok(text.includes('子代理'), '要说明 bot 起的子代理会自动登记进团队')
+})
+
+test('q18b 团队「查看」：onOpenMember 从 ProjectScreen 一路传到团队行，按钮不能空转', () => {
+  const source = readFileSync(CLIENT_FILE, 'utf8')
+  // 组件是函数，假 React 会直接展开，没法在元素树上断言 props；这里盯住三处传参和按钮绑定。
+  assert.match(source, /h\(PMProjectDetail,\s*\{[^}]*onOpenMember/, 'ProjectScreen 渲染项目详情时要带 onOpenMember')
+  assert.match(source, /h\(PMTeamTab,\s*\{[^}]*onOpenMember/, '项目详情渲染团队页时要带 onOpenMember')
+  assert.match(source, /function PMTeamTab\(\{[^}]*onOpenMember/, '团队页要接收 onOpenMember')
+  assert.match(source, /key: 'view'[^}]*openMember\(member\)/, '「查看」按钮必须调用 openMember')
+  assert.match(source, /onOpenMember\(member\.memberId, 'config'\)/, '查看要直接落到配置页')
 })
 
 test('q19 项目群聊面板：多人发言、@ 标注与群成员信息', () => {

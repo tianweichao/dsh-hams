@@ -48,7 +48,7 @@ test('t01 插件启动路径：bootstrap 出来的库可以直接跑闭环', () 
     assert.ok(submitted.detail?.checkId)
     const item = service.getWorkItem({ principalId: IDS.owner, channel: 'ui', correlationId: 'c8' }, workItemId)
     assert.equal(item.status, 'waiting_check')
-    assert.equal(runtime.report.meta.schema_version, '8')
+    assert.equal(runtime.report.meta.schema_version, '9')
   } finally {
     runtime.close()
   }
