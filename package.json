@@ -1,0 +1,76 @@
+{
+  "name": "dsh-hams",
+  "version": "0.1.0",
+  "description": "HAMS：DeepSeek Harness 内的人机工作台插件（项目 / 任务 / 人机成员 / 知识 / 记忆）",
+  "type": "module",
+  "license": "MIT",
+  "author": "tianweichao",
+  "homepage": "https://github.com/tianweichao/dsh-hams#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tianweichao/dsh-hams.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tianweichao/dsh-hams/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "hams",
+    "agent",
+    "project-management",
+    "sqlite"
+  ],
+  "engines": {
+    "node": ">=24.3",
+    "dsh": ">=0.2.2-rc.3 <0.3.0"
+  },
+  "scripts": {
+    "test": "node --test tests/store/*.test.ts tests/service/*.test.ts",
+    "test:py": "python3 tests/schema_selftest.py",
+    "schema:split": "node scripts/split-schema.mjs",
+    "schema:check": "node scripts/split-schema.mjs --check",
+    "store:init": "node scripts/init-store.mjs",
+    "store:backup": "node scripts/backup-store.mjs"
+  },
+  "main": "./src/index.js",
+  "exports": {
+    ".": {
+      "default": "./src/index.js"
+    },
+    "./client": {
+      "default": "./client/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "client/index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.1.0",
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/schemastery": "*"
+  }
+}

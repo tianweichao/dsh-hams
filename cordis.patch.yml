@@ -1,0 +1,16 @@
+# dsh-hams 的 bundle patch 层：加入 profile 的 dsh.profile.bundles 后自动展开。
+# id 唯一；name 必须与 package.json 的 name 一致。
+- insert:
+    - id: hams
+      name: dsh-hams
+      config:
+        dataDir: ''
+        tickMs: 5000
+        localPrincipalId: ''
+        defaultBotMemberId: ''
+        toolsEnabled: true
+        tickEnabled: true
+        backupKeep: 3
+        hostSession: auto
+        knowledgeSkillDirs: []
+        workspaceProfileFile: ''

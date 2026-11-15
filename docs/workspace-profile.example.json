@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "workspaceRoot": "/path/to/workspace",
+  "members": [
+    {
+      "key": "researcher",
+      "kind": "bot",
+      "name": "研究助手",
+      "role": "executor",
+      "domain": "研究",
+      "responsibility": "拆解研究问题、收集证据、写结论；不批准关单。",
+      "capabilities": ["work_item.claim", "work_item.execute", "evidence.append"]
+    },
+    {
+      "key": "analyst",
+      "kind": "bot",
+      "name": "分析助手",
+      "role": "executor",
+      "domain": "数据",
+      "responsibility": "查数、对比、给结论，并把口径与来源登记成证据。",
+      "capabilities": ["work_item.claim", "work_item.execute", "evidence.append", "metric.record"]
+    }
+  ],
+  "projects": [
+    {
+      "key": "demo",
+      "name": "示例项目",
+      "type": "continuous",
+      "status": "active",
+      "goalText": "用一个可核对的小目标跑通「目标 → 工作项 → 证据 → 复查」闭环。",
+      "coordinatorKey": "researcher",
+      "metrics": [
+        {
+          "name": "闭环完成率",
+          "direction": "higher",
+          "targetValue": 90,
+          "unit": "%",
+          "windowKind": "week",
+          "definitionText": "本周已关单工作项 / 本周应完成工作项；缺数时显示未知。",
+          "sourceKind": "manual"
+        }
+      ]
+    }
+  ],
+  "workItems": [
+    {
+      "key": "demo-first-loop",
+      "projectKey": "demo",
+      "title": "跑通第一个工作项闭环",
+      "domain": "研究",
+      "category": "研究推进",
+      "priority": 2,
+      "dueInDays": 7
+    }
+  ]
+}

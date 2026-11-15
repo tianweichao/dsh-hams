@@ -1,0 +1,18 @@
+# 本机/构建产物，不发布
+.DS_Store
+*.log
+*.tgz
+node_modules/
+_build/
+_refs/
+designs/
+progress/
+
+# 内部设计与真实工作区数据不随公开仓库发布
+docs/*
+!docs/README.md
+!docs/schema-2026-11-14.sql
+!docs/workspace-profile.example.json
+
+# 任何位置的真实工作区画像
+workspace-profile.json
