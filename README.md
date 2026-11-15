@@ -65,10 +65,14 @@ dsh plugin --profile desktop add dsh-hams
 ## 开发
 
 ```bash
+npm install        # 只装开发依赖（esbuild）
 npm test           # Node 自测（store + service）
 npm run test:py    # SQLite 库级不变量
 npm run schema:check
+npm run build      # 生成 dist/index.js（发布产物）
 ```
+
+`dist/index.js` 是 esbuild 打出的单文件 ESM：Node 不允许在 `node_modules` 内剥离 TypeScript，所以发布包只带构建产物，不带 `.ts` 源码。
 
 自测不访问真实 `$DSH_HOME`：存储与服务测试都跑在临时目录里，结束即释放。需要启动宿主做端到端验证时，也请使用独立的 `DSH_HOME` 和临时工作目录。
 

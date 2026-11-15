@@ -1,6 +1,6 @@
 {
   "name": "dsh-hams",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "description": "HAMS：DeepSeek Harness 内的人机工作台插件（项目 / 任务 / 人机成员 / 知识 / 记忆）",
   "type": "module",
   "license": "MIT",
@@ -32,12 +32,13 @@
     "schema:split": "node scripts/split-schema.mjs",
     "schema:check": "node scripts/split-schema.mjs --check",
     "store:init": "node scripts/init-store.mjs",
-    "store:backup": "node scripts/backup-store.mjs"
+    "store:backup": "node scripts/backup-store.mjs",
+    "build": "esbuild src/index.js --bundle --platform=node --format=esm --target=node24 --outfile=dist/index.js --external:@deepseek-ai/*"
   },
-  "main": "./src/index.js",
+  "main": "./dist/index.js",
   "exports": {
     ".": {
-      "default": "./src/index.js"
+      "default": "./dist/index.js"
     },
     "./client": {
       "default": "./client/index.js"
@@ -46,7 +47,7 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "src",
+    "dist",
     "client/index.js",
     "cordis.patch.yml",
     "README.md",
@@ -72,5 +73,8 @@
     "@deepseek-ai/cordis": "~4.1.0",
     "@deepseek-ai/dsh-tools": "*",
     "@deepseek-ai/schemastery": "*"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
   }
 }
