@@ -1,6 +1,6 @@
 {
   "name": "dsh-hams",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "HAMS：DeepSeek Harness 内的人机工作台插件（项目 / 任务 / 人机成员 / 知识 / 记忆）",
   "type": "module",
   "license": "MIT",

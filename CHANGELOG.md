@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.5 — 2026-11-16
+
+- 运行时 bot preset 与官方 `standard` 对齐：每个 bot 有独立 `hams-bot-*` preset，带 bash / 文件 / subagent / 联网工具；成员与子代理的职责提示词可在界面查看和编辑，改提示词会发新的 major 版本并按新配置开会话。
+- 子代理团队：DSH 子代理自动登记进项目团队，显示运行状态与任务提示词，可查看/编辑职责提示词。
+- 工作项：项目推进 bot 可直接用 `hams_create_work_item` 建单（自动去重、默认项目负责人、沿用项目模板）；其他 bot 需 `work_item.create` 且已进项目团队。
+- 群聊/单聊任务识别：独立模型调用（默认最低推理档，支持 off 时自动切到无思考模型）判断是否开新活、是否暂停/继续/取消已有工作项，不再用关键词规则。
+- 派发可靠性：指派后立即触发派发；组合 preset、建/恢复会话和派发周期都有超时；`hams_meta` 记录 `dispatch:heartbeat` / `dispatch:assign` / `dispatch:error`；界面会标出超过 90 秒仍未认领的「等待派发」。
+- 迁移 v9：`member_version.prompt`；工具增至 16 个；Node 自测 243 项。
+
 ## 0.1.2 — 2026-11-15
 
 首个公开可用版本。
